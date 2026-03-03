@@ -964,19 +964,657 @@ aws s3 cp test-index.html s3://fitcloud-website-dev/index.html
 
 ### Module 2: Authentication (Cognito)
 
-**Status:** Pending
+**Status:** In Progress
+**AWS Domain:** Cognito, IAM | Estimated: 3-4 hours | Priority: High
+**Free Tier:** 50,000 MAU (Monthly Active Users) per month
+
+---
+
+#### Key Concepts to Understand
+
+**What is Amazon Cognito?**
+Amazon Cognito is AWS's fully managed identity and access management service. It handles user registration, authentication, and authorization for your applications. Think of it as "Auth0 or Firebase, but from AWS."
+
+Cognito has two main components:
+
+**User Pools:**
+
+- A user directory that lets users sign up and sign in to your application
+- Handles all aspects of user management: registration, sign-in, password reset, MFA, email/phone verification
+- Issues JSON Web Tokens (JWTs) that your API can validate
+- Free for first 50,000 MAU per month
+
+**Identity Pools (Cognito Federated Identities):**
+
+- Lets you grant temporary AWS credentials to access AWS services
+- Useful when your frontend needs direct access to AWS services (like uploading directly to S3)
+- Not needed for most web apps -- User Pools + API Gateway is usually sufficient
+
+**For FitCloud:** We only need a **User Pool**. The JWT tokens will be validated by API Gateway, and our Lambda functions will use the `userId` from the token to scope data to the authenticated user. We do NOT need an Identity Pool.
+
+**OAuth 2.0 Grants:**
+
+- **Authorization Code Grant** (recommended): Client gets an authorization code first, then exchanges it for tokens. Most secure -- tokens never exposed to the browser.
+- **Implicit Grant** (legacy): Tokens returned directly in URL. Less secure -- not recommended for production.
+- **Client Credentials Grant**: For machine-to-machine communication, not user authentication.
+
+We'll use **Authorization Code Grant** with PKCE (Proof Key for Code Exchange) for security.
+
+**JWT Tokens (JSON Web Tokens):**
+When a user signs in, Cognito returns three tokens:
+
+1. **ID Token**: Contains user attributes (email, name, sub). Use for getting user info.
+2. **Access Token**: Contains scopes and expiration. Use for API authorization.
+3. **Refresh Token**: Long-lived token used to get new ID and access tokens without re-authenticating.
+
+**How Cognito Connects to API Gateway (Preview for Module 3):**
+
+```
+User (React App)
+    │
+    ▼ (1. Sign in via Hosted UI)
+Cognito User Pool
+    │
+    ▼ (2. Returns JWT tokens)
+User's Browser (stores tokens)
+    │
+    ▼ (3. API request with Bearer token)
+API Gateway
+    │
+    ▼ (4. Validates JWT with Cognito)
+Lambda Function (receives userId in context)
+    │
+    ▼ (5. Query DynamoDB with userId)
+DynamoDB (user's private data)
+```
+
+---
+
+#### Architecture Diagram (FitCloud)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         FITCLOUD ARCHITECTURE                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────┐      ┌──────────────┐      ┌──────────────────┐    │
+│  │  React   │──────▶│  API Gateway │──────▶│    Lambda        │    │
+│  │  Frontend│      │  (Protected) │      │  (Workouts API)  │    │
+│  └──────────┘      └──────────────┘      └────────┬─────────┘    │
+│       │                     │                      │               │
+│       │ JWT Bearer         │                      ▼               │
+│       │ Token             │              ┌──────────────────┐       │
+│       │                   │              │    DynamoDB      │       │
+│       ▼                   │              │  (userId-based)  │       │
+│  ┌──────────────┐        │              └──────────────────┘       │
+│  │  Cognito     │◀───────┘                                           │
+│  │  User Pool   │         Cognito validates JWT, API Gateway         │
+│  │  (Auth)      │         authorizes request before Lambda runs      │
+│  └──────────────┘                                                 │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key insight:** The frontend NEVER talks directly to DynamoDB. All requests go through API Gateway, which validates the JWT token from Cognito before allowing the request through.
+
+---
 
 #### Task 2.1: Cognito User Pool Setup
 
 **Status:** Pending
 
+**What you'll create:**
+
+1. A Cognito User Pool with email-based sign-in
+2. Password policy configuration
+3. Email verification settings
+4. Custom domain for the Hosted UI
+
+**Terraform resources used:**
+
+| Resource                       | Purpose                     |
+| ------------------------------ | --------------------------- |
+| `aws_cognito_user_pool`        | The user directory          |
+| `aws_cognito_user_pool_domain` | Custom domain for Hosted UI |
+
+**How-to:**
+
+1. **Create Cognito User Pool**
+   - Declare an `aws_cognito_user_pool` resource
+   - Set `name` with environment suffix (e.g., `fitcloud-dev`)
+   - Configure `alias_attributes` to allow sign-in with email
+   - Set password policy (minimum 8 chars, require uppercase, lowercase, numbers, symbols)
+   - Enable auto-verification for email
+   - Configure email verification message
+
+2. **Configure Password Policy**
+   - `minimum_length`: 8 characters
+   - `require_lowercase`: true
+   - `require_uppercase`: true
+   - `require_numbers`: true
+   - `require_symbols`: true
+
+3. **Set Up Email Verification**
+   - `auto_verified_attributes`: ["email"]
+   - Cognito will send a verification code to the user's email
+   - For development, Cognito's default email sender is fine
+   - For production, you'd configure SES (Simple Email Service)
+
+4. **Create User Pool Domain**
+   - Declare an `aws_cognito_user_pool_domain` resource
+   - Set a unique `domain` prefix (e.g., `fitcloud-auth-dev`)
+   - This creates the hosted UI URL: `https://fitcloud-auth-dev.auth.us-east-1.amazoncognito.com`
+
+**Lessons Learned:**
+
+- Cognito User Pools are free for up to 50,000 MAU -- more than enough for learning.
+- Email is the easiest sign-in method. Phone numbers require AWS SNS costs.
+- The domain prefix must be globally unique across all AWS accounts.
+- Once created, you cannot change the sign-in method (email vs phone vs username). If you need to change, you must recreate the pool.
+- The "sub" (subject) attribute is a unique user ID -- use this as the partition key in DynamoDB.
+
+**Code Snippets:**
+
+```hcl
+# terraform/main.tf - Add after Module 1 resources
+
+# --- Cognito User Pool ---
+resource "aws_cognito_user_pool" "main" {
+  name = "fitcloud-${var.environment}"
+
+  # Allow users to sign in with email
+  alias_attributes = ["email"]
+
+  # Password policy - strong security
+  password_policy {
+    minimum_length                   = 8
+    require_lowercase                = true
+    require_uppercase                = true
+    require_numbers                  = true
+    require_symbols                  = true
+  }
+
+  # Auto-verify email addresses
+  auto_verified_attributes = ["email"]
+
+  # Email configuration (use Cognito's default for dev)
+  email_configuration {
+    email_sending_account = "COGNITO_DEFAULT"
+  }
+
+  # Schema attributes - what user data to store
+  schema {
+    name                = "email"
+    attribute_data_type = "String"
+    required           = true
+    mutable            = false  # Cannot be changed after creation
+  }
+
+  schema {
+    name                = "name"
+    attribute_data_type = "String"
+    required           = false
+    mutable            = true
+  }
+
+  # User invitation message (for admin-created users)
+  user_invitation_message {
+    subject   = "Your FitCloud login invite"
+    html_body = "<p>Your temporary password is {####}</p>"
+  }
+
+  # Email subject for verification
+  verification_message_template {
+    default_email_option = "CONFIRM_WITH_CODE"
+  }
+
+  tags = {
+    Project     = "FitCloud"
+    Environment = var.environment
+  }
+}
+
+# --- Cognito User Pool Domain (for Hosted UI) ---
+resource "aws_cognito_user_pool_domain" "main" {
+  domain       = "fitcloud-auth-${var.environment}"
+  user_pool_id = aws_cognito_user_pool.main.id
+}
+```
+
+```bash
+# Verify Cognito User Pool was created
+aws cognito-idp list-user-pools --max-results 20
+
+# Get User Pool details
+aws cognito-idp describe-user-pool --user-pool-id <your-pool-id>
+
+# Get Domain status
+aws cognito-idp describe-user-pool-domain --domain fitcloud-auth-dev
+
+# Test Hosted UI URL
+# https://fitcloud-auth-dev.auth.us-east-1.amazoncognito.com
+# (This will fail until we create the App Client in Task 2.2)
+```
+
+**Study Questions:**
+
+- What's the difference between a User Pool and an Identity Pool?
+- Why do we use email as the sign-in attribute?
+- What does the "sub" attribute represent in Cognito?
+- Why is the Authorization Code Grant preferred over Implicit Grant?
+- What happens if you need to change sign-in method after creating the pool?
+
+**Resources:**
+
+- [Cognito User Pools Documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-identity-pools.html)
+- [Terraform aws_cognito_user_pool](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cognito_user_pool)
+- [Cognito Pricing](https://aws.amazon.com/cognito/pricing/)
+
+---
+
 #### Task 2.2: App Client Configuration
 
 **Status:** Pending
 
+**What you'll create:**
+
+1. An App Client for the React frontend
+2. OAuth 2.0 configuration with Authorization Code Grant
+3. Callback and logout URLs
+4. Token settings (validity periods)
+
+**What is an App Client?**
+An App Client is a configuration within the User Pool that represents your application. Each app (web, mobile, etc.) gets its own client with its own settings. The client ID is public, but the client secret (if generated) must be kept secure.
+
+For a **public client** (like a React SPA), we do NOT generate a client secret because it would be exposed in the browser anyway.
+
+**Terraform resources used:**
+
+| Resource                       | Purpose                          |
+| ------------------------------ | -------------------------------- |
+| `aws_cognito_user_pool_client` | Application client configuration |
+
+**How-to:**
+
+1. **Create App Client**
+   - Declare an `aws_cognito_user_pool_client` resource
+   - Link to the User Pool
+   - Set a friendly name (e.g., "FitCloud Web App")
+   - Set `generate_secret = false` (public client for SPA)
+   - Configure OAuth 2.0 settings
+
+2. **Configure OAuth 2.0**
+   - Enable OAuth for the client: `allowed_oauth_flows_user_pool_client = true`
+   - Set OAuth flows: `["code"]` (Authorization Code Grant with PKCE)
+   - Set OAuth scopes: `["openid", "email", "profile"]`
+     - `openid`: Required for OIDC -- returns ID token
+     - `email`: Returns email in ID token
+     - `profile`: Returns name/picture in ID token
+
+3. **Set Callback and Logout URLs**
+   - `callback_urls`: Where to redirect after successful auth
+     - Development: `["http://localhost:5173"]`
+     - Later: `["https://yourdomain.com"]`
+   - `logout_urls`: Where to redirect after sign out
+
+4. **Configure Token Validity**
+   - Access token: 1 hour (3600 seconds)
+   - ID token: 1 hour
+   - Refresh token: 30 days
+   - Enable token revocation for security
+
+**Lessons Learned:**
+
+- The App Client ID is public (it's in your React code), but that's okay -- the actual authentication happens securely server-side.
+- Use Authorization Code Grant with PKCE for SPAs -- it's the most secure OAuth flow for browser-based apps.
+- You can create multiple App Clients for different platforms (web, mobile) with different settings.
+- Once created, some settings cannot be changed. If you mess up, delete and recreate the client.
+- The `generate_secret = true` is only for server-side apps (confidential clients). For React SPAs, always use `false`.
+
+**Code Snippets:**
+
+```hcl
+# terraform/main.tf - Add App Client
+
+# --- Cognito App Client ---
+resource "aws_cognito_user_pool_client" "main" {
+  name = "fitcloud-web-app"
+
+  user_pool_id = aws_cognito_user_pool.main.id
+
+  # OAuth 2.0 Configuration
+  allowed_oauth_flows                  = ["code"]
+  allowed_oauth_flows_user_pool_client = true
+  allowed_oauth_scopes                 = ["openid", "email", "profile"]
+
+  # Callback and Logout URLs
+  callback_urls = [
+    "http://localhost:5173",
+    "https://${var.domain != "" ? var.domain : "localhost:5173"}"
+  ]
+
+  logout_urls = [
+    "http://localhost:5173",
+    "https://${var.domain != "" ? var.domain : "localhost:5173"}"
+  ]
+
+  # Token Settings
+  access_tokenValidity  = 1  # 1 hour
+  id_token_validity     = 1  # 1 hour
+  refresh_token_validity = 30 # 30 days
+
+  # Enable token revocation for security
+  enable_token_revocation = true
+
+  # Auth flows - SRP (Secure Remote Password) is the default and recommended
+  explicit_auth_flows = [
+    "ALLOW_USER_SRP_AUTH",
+    "ALLOW_REFRESH_TOKEN_AUTH"
+  ]
+
+  # Prevent user existence errors (security best practice)
+  prevent_user_existence_errors = "ENABLED"
+
+  # Read/Write attributes
+  read_attributes  = ["email", "email_verified", "name", "sub"]
+  write_attributes = ["email", "name"]
+
+  depends_on = [aws_cognito_user_pool.main]
+}
+```
+
+```hcl
+# terraform/variables.tf - Add domain variable
+
+variable "domain" {
+  description = "Domain name for the application (optional)"
+  type        = string
+  default     = ""
+}
+```
+
+```hcl
+# terraform/outputs.tf - Add Cognito outputs
+
+output "cognito_user_pool_id" {
+  description = "Cognito User Pool ID"
+  value       = aws_cognito_user_pool.main.id
+}
+
+output "cognito_user_pool_client_id" {
+  description = "Cognito App Client ID"
+  value       = aws_cognito_user_pool_client.main.id
+}
+
+output "cognito_user_pool_endpoint" {
+  description = "Cognito User Pool endpoint"
+  value       = aws_cognito_user_pool.main.endpoint
+}
+
+output "cognito_hosted_ui_url" {
+  description = "Cognito Hosted UI URL"
+  value       = "https://${aws_cognito_user_pool_domain.main.domain}.auth.${var.aws_region}.amazoncognito.com"
+}
+```
+
+**Testing the Hosted UI:**
+
+Once both Task 2.1 and 2.2 are complete, you can test the Hosted UI:
+
+```bash
+# The Hosted UI URL format:
+# https://<domain>.auth.<region>.amazoncognito.com/login?
+#   client_id=<client-id>&
+#   response_type=code&
+#   scope=openid+email+profile&
+#   redirect_uri=<callback-url>
+
+# Example (replace with your values):
+# https://fitcloud-auth-dev.auth.us-east-1.amazoncognito.com/login?
+#   client_id=abc123def456&
+#   response_type=code&
+#   scope=openid+email+profile&
+#   redirect_uri=http://localhost:5173
+
+# Visit this URL in your browser:
+# 1. You'll see the Cognito Hosted Login page
+# 2. Click "Sign up" to create a new account
+# 3. Enter email, password, name
+# 4. Check email for verification code
+# 5. Enter verification code
+# 6. You'll be redirected to http://localhost:5173 with an authorization code
+# 7. The React app will exchange the code for tokens (handled by Amplify)
+```
+
+**Study Questions:**
+
+- What's the difference between a public client and a confidential client?
+- Why do we use Authorization Code Grant instead of Implicit Grant?
+- What is PKCE (Proof Key for Code Exchange) and why does it matter?
+- What OAuth scopes do we need, and why each one?
+- Why is `prevent_user_existence_errors = "ENABLED"` a security best practice?
+
+**Resources:**
+
+- [App Client Configuration](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-client-apps.html)
+- [OAuth 2.0 Grants](https://docs.aws.amazon.com/cognito/latest/developerguide/federation-endpoints-oauth-grants.html)
+- [Terraform aws_cognito_user_pool_client](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cognito_user_pool_client)
+
+---
+
 #### Task 2.3: Cognito Identity Pool (Optional)
 
-**Status:** Pending
+**Status:** Not Required for FitCloud
+
+**What is an Identity Pool?**
+A Cognito Identity Pool (also called "Cognito Federated Identities") provides temporary AWS credentials to access AWS services directly from your frontend. This is different from User Pools, which only handle authentication.
+
+**When would you need an Identity Pool?**
+
+- You want users to upload files directly to S3 from the browser (bypassing your API)
+- You want to call AWS services (like DynamoDB, Lambda) directly from the frontend with fine-grained permissions
+- You need to support social login (Google, Facebook) AND want AWS service access
+
+**For FitCloud, we do NOT need an Identity Pool because:**
+
+1. Our API Gateway + Lambda architecture handles all data access
+2. Users never need to access AWS services directly
+3. JWT tokens from User Pools are sufficient for API authorization
+
+**If you wanted to explore it later, here's the concept:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│           IDENTITY POOL (COGNITO FEDERATED IDENTITIES)      │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  User signs in with:  ──┐                                    │
+│  - Cognito User Pool    │                                    │
+│  - Social Provider      │                                    │
+│  - Custom Auth          │                                    │
+│                         ▼                                    │
+│                    ┌─────────────┐                           │
+│                    │   Identity  │                           │
+│                    │    Pool     │                           │
+│                    └──────┬──────┘                           │
+│                           │                                   │
+│         ┌────────────────┼────────────────┐                 │
+│         ▼                ▼                ▼                 │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │  Unauth     │  │ Auth IAM   │  │ Auth IAM    │         │
+│  │  (Guest)    │  │   Role     │  │   Role      │         │
+│  │   Role      │  │  (Users)   │  │ (Admins)    │         │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
+│         │                │                │                   │
+│         ▼                ▼                ▼                   │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │   AWS       │  │   AWS       │  │   AWS       │         │
+│  │   Services  │  │   Services  │  │   Services  │         │
+│  │  (Limited)  │  │  (Full)    │  │  (Full+)    │         │
+│  └─────────────┘  └─────────────┘  └─────────────┘         │
+│                                                              │
+│  Use Case: Upload to S3, call DynamoDB directly              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Terraform code (for reference only, not implementing):**
+
+```hcl
+# Optional - Only if you need direct AWS service access from frontend
+
+resource "aws_cognito_identity_pool" "main" {
+  identity_pool_name = "fitcloud-identity-pool-${var.environment}"
+  allow_unauthenticated_identities = false  # No guest access
+
+  cognito_identity_providers {
+    user_pool_id         = aws_cognito_user_pool.main.id
+    client_id            = aws_cognito_user_pool_client.main.id
+    provider_name        = "cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.main.id}"
+  }
+}
+
+# IAM roles for authenticated users
+resource "aws_iam_role" "authenticated" {
+  name = "Cognito_${aws_cognito_identity_pool.main.id}_Auth_Role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = "cognito-identity.amazonaws.com"
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "cognito-identity.amazonaws.com:aud": aws_cognito_identity_pool.main.id
+        }
+        "ForAnyValue:StringLike" = {
+          "cognito-identity.amazonaws.com:amr": ["authenticated"]
+        }
+      }
+    }]
+  })
+}
+```
+
+**Study Questions:**
+
+- What's the main difference between User Pools and Identity Pools?
+- Why don't we need an Identity Pool for FitCloud?
+- What are the security implications of allowing unauthenticated identities?
+
+---
+
+#### How Cognito Connects to API Gateway (Preview for Module 3)
+
+In Module 3, we'll secure our API Gateway endpoints using Cognito. Here's the pattern:
+
+```hcl
+# terraform/main.tf - Preview (will add in Module 3)
+
+# Cognito Authorizer
+resource "aws_api_gateway_authorizer" "cognito" {
+  name                   = "fitcloud-cognito-authorizer"
+  rest_api_id           = aws_api_gateway_rest_api.main.id
+  type                   = "COGNITO_USER_POOLS"
+  provider_arns         = [aws_cognito_user_pool.main.arn]
+
+  # Cache authorizer results for 5 minutes
+  authorizer_result_ttl_in_seconds = 300
+}
+
+# Then on each API Gateway method, add:
+# authorization = "COGNITO_USER_POOLS"
+# authorizer_id = aws_api_gateway_authorizer.cognito.id
+```
+
+**The Flow:**
+
+1. User signs in via Hosted UI → gets JWT tokens
+2. User makes API request with `Authorization: Bearer <access_token>`
+3. API Gateway validates the token against Cognito User Pool
+4. If valid, request passes through to Lambda
+5. Lambda receives `event.requestContext.authorizer.claims.sub` as the userId
+
+---
+
+#### Module 2 Deployment Workflow
+
+```bash
+cd terraform
+
+# 1. Format code
+terraform fmt -recursive
+
+# 2. Validate syntax
+terraform validate
+
+# 3. Preview what will be created
+terraform plan
+
+# 4. Apply (creates real AWS resources)
+terraform apply
+
+# 5. Note the outputs
+# - cognito_user_pool_id
+# - cognito_user_pool_client_id
+# - cognito_hosted_ui_url
+
+# 6. Test the Hosted UI
+# Visit: https://fitcloud-auth-dev.auth.us-east-1.amazoncognito.com
+# Sign up a test user
+# Verify email
+# Sign in
+```
+
+---
+
+#### Module 2 Verification Checklist
+
+- [ ] Cognito User Pool exists and is active
+- [ ] Domain is created (verify at https://us-east-1.console.aws.amazon.com/cognito/home)
+- [ ] App Client is created with OAuth 2.0 enabled
+- [ ] OAuth Scopes include: openid, email, profile
+- [ ] Callback URL matches your frontend (http://localhost:5173)
+- [ ] Hosted UI loads and displays login page
+- [ ] User can sign up with email
+- [ ] Verification email is received
+- [ ] User can confirm email and sign in
+- [ ] After sign-in, redirected to callback URL with code
+- [ ] terraform plan shows no pending changes
+
+---
+
+#### AWS Cloud Practitioner Exam Topics Covered
+
+| Exam Domain | Topic from this module                                         |
+| ----------- | -------------------------------------------------------------- |
+| Security    | IAM roles, Cognito User Pools, OAuth 2.0, JWT tokens           |
+| Technology  | Cognito vs Auth0/Firebase, API Gateway authorization           |
+| Billing     | Cognito free tier (50,000 MAU), no hidden costs for basic auth |
+
+**Key Exam Points:**
+
+- Cognito User Pools handle user authentication (sign up, sign in, MFA)
+- Identity Pools handle authorization (temporary AWS credentials)
+- JWT tokens contain user identity information
+- API Gateway can validate Cognito tokens without Lambda
+- Cognito is a fully managed service (no servers to manage)
+
+---
+
+#### Common Mistakes to Avoid
+
+1. **Using the wrong sign-in method**: Can't change email → phone after creation. Recreate pool if needed.
+2. **Forgetting callback URLs**: The OAuth flow won't work without matching callback URLs.
+3. **Not using PKCE**: Always use Authorization Code Grant with PKCE for SPAs, not Implicit Grant.
+4. **Generating client secret for SPA**: Public clients shouldn't have secrets (exposed in browser).
+5. **Ignoring token expiration**: Access tokens expire in 1 hour. Refresh tokens handle renewal.
+6. **Missing OAuth scopes**: Without "openid" scope, you won't get an ID token.
+7. **Not enabling token revocation**: Allows logout from all devices.
+8. **Using Identity Pool when not needed**: Most web apps don't need it. User Pool + API Gateway is sufficient.
 
 ---
 
