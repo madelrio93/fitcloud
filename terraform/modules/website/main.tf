@@ -1,13 +1,8 @@
-provider "aws" {
-  region = var.aws_region
-}
-
-# --- S3 Bucket ---
 resource "aws_s3_bucket" "website" {
-  bucket = "fitcloud-website-${var.environment}"
+  bucket = "${var.project_name}-website-${var.environment}"
 
   tags = {
-    Project     = "FitCloud"
+    Project     = var.project_name
     Environment = var.environment
   }
 }
@@ -28,31 +23,29 @@ resource "aws_s3_bucket_public_access_block" "website" {
   restrict_public_buckets = true
 }
 
-# --- OAC ---
 resource "aws_cloudfront_origin_access_control" "website" {
-  name                              = "fitcloud-oac"
+  name                              = "${var.project_name}-oac-${var.environment}"
   origin_access_control_origin_type = "s3"
   signing_behavior                  = "always"
   signing_protocol                  = "sigv4"
 }
 
-# --- CloudFront Distribution ---
 resource "aws_cloudfront_distribution" "website" {
   origin {
     domain_name              = aws_s3_bucket.website.bucket_regional_domain_name
     origin_access_control_id = aws_cloudfront_origin_access_control.website.id
-    origin_id                = "S3-fitcloud-website"
+    origin_id                = "S3-${var.project_name}-website"
   }
 
   enabled             = true
   is_ipv6_enabled     = true
-  default_root_object = "index.html"
-  price_class         = "PriceClass_100" # cheapest option
+  default_root_object = var.default_root_object
+  price_class         = var.price_class
 
   default_cache_behavior {
     allowed_methods        = ["GET", "HEAD", "OPTIONS"]
     cached_methods         = ["GET", "HEAD"]
-    target_origin_id       = "S3-fitcloud-website"
+    target_origin_id       = "S3-${var.project_name}-website"
     viewer_protocol_policy = "redirect-to-https"
 
     forwarded_values {
@@ -63,11 +56,10 @@ resource "aws_cloudfront_distribution" "website" {
     }
 
     min_ttl     = 0
-    default_ttl = 3600  # 1 hour
-    max_ttl     = 86400 # 24 hours
+    default_ttl = 3600
+    max_ttl     = 86400
   }
 
-  # IMPORTANT for React SPA: return index.html for 403/404
   custom_error_response {
     error_code         = 403
     response_code      = 200
@@ -87,16 +79,15 @@ resource "aws_cloudfront_distribution" "website" {
   }
 
   viewer_certificate {
-    cloudfront_default_certificate = true # uses *.cloudfront.net domain
+    cloudfront_default_certificate = true
   }
 
   tags = {
-    Project     = "FitCloud"
+    Project     = var.project_name
     Environment = var.environment
   }
 }
 
-# --- S3 Bucket Policy (allow CloudFront) ---
 data "aws_iam_policy_document" "website" {
   statement {
     sid    = "AllowCloudFrontReadOnly"

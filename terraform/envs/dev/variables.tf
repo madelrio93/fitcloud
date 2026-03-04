@@ -10,3 +10,10 @@ variable "environment" {
   type        = string
   default     = "dev"
 }
+
+variable "project_name" {
+  description = "Project name used in resource names and tags"
+  type        = string
+  default     = "fitcloud"
+}
+
