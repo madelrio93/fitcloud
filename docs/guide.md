@@ -2056,21 +2056,1567 @@ terraform apply
 
 ---
 
-### Module 3: Workout Tracking (DynamoDB + Lambda)
+### Module 3: Workout Tracking (DynamoDB + Lambda + API Gateway)
+
+**Status:** In Progress
+**AWS Domain:** DynamoDB, Lambda, API Gateway, IAM | Estimated: 6-8 hours | Priority: High
+**Free Tier:** DynamoDB = 25 GB storage (on-demand) | Lambda = 1M requests/month | API Gateway = 1M requests/month
+
+---
+
+#### Key Concepts to Understand
+
+**What is Amazon DynamoDB?**
+DynamoDB is AWS's fully managed NoSQL database service. It delivers single-digit millisecond performance at any scale. Think of it as "a key-value store with document support" -- you can store JSON documents, access them by key, and scale infinitely without managing servers.
+
+DynamoDB has two data models:
+
+- **Key-Value**: Primary key is either just a Partition Key (PK) or Partition Key + Sort Key (SK)
+- **Document**: Values can be JSON objects, arrays, strings, numbers, booleans, and null
+
+**Partition Key (PK) and Sort Key (SK):**
+
+Every DynamoDB table has a primary key. Two options:
+
+1. **Partition Key Only**: Just one key. All items with the same PK are stored together.
+2. **Partition Key + Sort Key (Composite)**: Two keys. Items with the same PK are stored together, sorted by SK.
+
+The combination of PK + SK must be unique for each item.
+
+**Single-Table Design:**
+
+In DynamoDB, the recommended pattern is **single-table design**:
+
+- One table stores multiple entity types (users, workouts, exercises, sets)
+- Different entity types use different key patterns
+- Related data is denormalized (stored together)
+- Uses **GSIs (Global Secondary Indexes)** for alternate access patterns
+- This is different from relational database normalization!
+
+**On-Demand vs Provisioned Capacity:**
+
+| Mode            | Pricing                                                               | Use Case                                             |
+| --------------- | --------------------------------------------------------------------- | ---------------------------------------------------- |
+| **On-Demand**   | Pay per request ($0.25 per million WRU, $0.25 per million RRU)        | Unpredictable workloads, development, low traffic    |
+| **Provisioned** | You reserve RCUs/WCUs per second ($0.00013 per RCU, $0.00065 per WCU) | Predictable high traffic, cost optimization at scale |
+
+For learning: **Always use on-demand**. It fits the free tier perfectly and you won't accidentally spend money.
+
+**Consistency Models:**
+
+- **Eventual Consistency** (default): Reads may return stale data briefly. Cheaper (half the RCU). Most apps are fine with this.
+- **Strong Consistency**: Reads always return the latest data. Costs double RCU. Use when data integrity is critical.
+
+**RCUs and WCUs:**
+
+- **RCU (Read Capacity Unit)**: 1 strongly consistent read/sec of up to 4KB, OR 2 eventually consistent reads/sec of up to 4KB
+- **WCU (Write Capacity Unit)**: 1 write/sec of up to 1KB
+
+For the exam: Remember that on-demand mode abstracts this away -- you just pay per request.
+
+**Global Secondary Indexes (GSIs):**
+
+- An GSI lets you query data using a different key pattern than the primary key
+- Think of it as a "secondary index" like in relational databases
+- Can have different partition key than the main table
+- Read/write capacity can be separate from the main table
+- Use for: alternate access patterns, denormalization, different query needs
+
+---
+
+#### DynamoDB Access Patterns for FitCloud
+
+For a fitness tracker, here are our access patterns. We're using **single-table design** with composite primary key:
+
+**Key Schema:**
+
+| Entity Type           | Partition Key (PK) | Sort Key (SK)                              |
+| --------------------- | ------------------ | ------------------------------------------ |
+| User metadata         | `USER#<userId>`    | `PROFILE`                                  |
+| Workout               | `USER#<userId>`    | `WORKOUT#<workoutId>#<timestamp>`          |
+| Exercise (in workout) | `USER#<userId>`    | `EXERCISE#<workoutId>#<exerciseId>`        |
+| Set (of exercise)     | `USER#<userId>`    | `SET#<workoutId>#<exerciseId>#<setNumber>` |
+
+**Access Pattern Table:**
+
+| #   | Access Pattern              | Query Type | Key Expression                                                    | Notes                     |
+| --- | --------------------------- | ---------- | ----------------------------------------------------------------- | ------------------------- |
+| 1   | Get all workouts for a user | Query      | `PK = USER#<userId>` AND `SK begins_with "WORKOUT#"`              | Paginated, sorted by date |
+| 2   | Get a specific workout      | GetItem    | `PK = USER#<userId>`, `SK = WORKOUT#<id>#<timestamp>`             | Single item               |
+| 3   | Get exercises for a workout | Query      | `PK = USER#<userId>` AND `SK begins_with "WORKOUT#<id>#EXERCISE"` | All exercises in workout  |
+| 4   | Get user's profile          | GetItem    | `PK = USER#<userId>`, `SK = "PROFILE"`                            | User metadata             |
+| 5   | Update workout status       | UpdateItem | `PK = USER#<userId>`, `SK = WORKOUT#<id>#<timestamp>`             | Change status field       |
+
+**Entity Data Models:**
+
+```typescript
+// Workout Entity
+{
+  PK: "USER#abc123",
+  SK: "WORKOUT#workout-001#1700000000",
+  entityType: "WORKOUT",
+  workoutId: "workout-001",
+  name: "Morning Strength",
+  type: "STRENGTH",
+  date: "2025-01-01",
+  duration: 3600,  // seconds
+  notes: "Felt strong today",
+  status: "COMPLETED",
+  createdAt: "2025-01-01T08:00:00Z",
+  updatedAt: "2025-01-01T09:00:00Z"
+}
+
+// Exercise Entity
+{
+  PK: "USER#abc123",
+  SK: "EXERCISE#workout-001#ex-001",
+  entityType: "EXERCISE",
+  workoutId: "workout-001",
+  exerciseId: "ex-001",
+  name: "Bench Press",
+  order: 1,
+  notes: "Warm up set"
+}
+
+// Set Entity
+{
+  PK: "USER#abc123",
+  SK: "SET#workout-001#ex-001#1",
+  entityType: "SET",
+  workoutId: "workout-001",
+  exerciseId: "ex-001",
+  setNumber: 1,
+  reps: 10,
+  weight: 135,  // lbs
+  weightUnit: "lbs",
+  completed: true
+}
+```
+
+**Why This Design?**
+
+1. **User isolation**: Every query starts with `USER#<userId>` -- users can ONLY access their own data
+2. **Single-table**: All entities in one table means one IAM policy, one connection pool, simpler application
+3. **Hierarchical SK**: `WORKOUT#<id>#<timestamp>` groups workout with its exercises/sets
+4. **Sort key ordering**: Within a user's workouts, they're naturally sorted by timestamp
+
+---
+
+#### Task 3.1: DynamoDB Table Setup
 
 **Status:** Pending
 
-#### Task 3.1: DynamoDB Table Design
+**What you'll create:**
+
+1. A DynamoDB table with composite primary key (userId + entityType#timestamp)
+2. On-demand billing mode (pay-per-request)
+3. Server-side encryption (enabled by default)
+4. Tags for cost tracking
+
+**Terraform resources used:**
+
+| Resource             | Purpose                    |
+| -------------------- | -------------------------- |
+| `aws_dynamodb_table` | Creates the DynamoDB table |
+
+**How-to:**
+
+1. **Create the DynamoDB table**
+   - Create a new module: `terraform/modules/dynamodb/`
+   - Declare `aws_dynamodb_table` resource
+   - Set `name = "fitcloud-workouts-${var.environment}"`
+   - Set `billing_mode = "PAY_PER_REQUEST"` (on-demand)
+   - Define `hash_key` = `userId` (String)
+   - Define `range_key` = `sortKey` (String)
+
+2. **Configure the key schema**
+
+   ```hcl
+   hash_key  = "userId"
+   range_key = "sortKey"
+
+   attribute {
+     name = "userId"
+     type = "S"  # String
+   }
+
+   attribute {
+     name = "sortKey"
+     type = "S"  # String
+   }
+   ```
+
+3. **Add tags for cost tracking**
+
+   ```hcl
+   tags = {
+     Project     = var.project_name
+     Environment = var.environment
+   }
+   ```
+
+4. **Export the table name and ARN** for use by Lambda and IAM policies
+
+**Lessons Learned:**
+
+- On-demand billing is perfect for learning and development -- no capacity planning needed
+- DynamoDB server-side encryption is enabled by default using AWS-managed keys
+- The table name is used in Lambda IAM policies to grant access
+- Single-table design means one table for all entity types
+
+**Code Snippets:**
+
+```hcl
+# terraform/modules/dynamodb/main.tf
+
+resource "aws_dynamodb_table" "workouts" {
+  name           = "${var.project_name}-workouts-${var.environment}"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "userId"
+  range_key      = "sortKey"
+
+  attribute {
+    name = "userId"
+    type = "S"
+  }
+
+  attribute {
+    name = "sortKey"
+    type = "S"
+  }
+
+  # Enable TTL for automatic cleanup (optional, for future use)
+  ttl {
+    attribute_name = "expiresAt"
+    enabled        = false  # Enable when needed
+  }
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+  }
+}
+```
+
+```hcl
+# terraform/modules/dynamodb/variables.tf
+
+variable "project_name" {
+  description = "Project name"
+  type        = string
+}
+
+variable "environment" {
+  description = "Environment (dev, prod)"
+  type        = string
+}
+```
+
+```hcl
+# terraform/modules/dynamodb/outputs.tf
+
+output "table_name" {
+  description = "DynamoDB table name"
+  value       = aws_dynamodb_table.workouts.name
+}
+
+output "table_arn" {
+  description = "DynamoDB table ARN"
+  value       = aws_dynamodb_table.workouts.arn
+}
+```
+
+```bash
+# Verify table creation
+aws dynamodb list-tables
+
+# Describe table
+aws dynamodb describe-table --table-name fitcloud-workouts-dev
+
+# Check billing mode
+aws dynamodb describe-table --table-name fitcloud-workouts-dev | jq '.Table.BillingModeSummary'
+```
+
+**Study Questions:**
+
+- Why is single-table design recommended for DynamoDB?
+- What's the difference between partition key and sort key?
+- When would you use a GSI (Global Secondary Index)?
+- Why use on-demand billing for development?
+- How does DynamoDB ensure data isolation between users?
+
+**Resources:**
+
+- [DynamoDB Developer Guide](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html)
+- [DynamoDB Core Components](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html)
+- [Single-Table Design](https://aws.amazon.com/blogs/database/single-table-vs-multi-table-design-in-aws-dynamodb-and-why-it-matters/)
+- [Terraform aws_dynamodb_table](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/dynamodb_table)
+
+---
+
+#### Key Concepts: AWS Lambda
+
+**What is AWS Lambda?**
+Lambda is AWS's serverless compute service. You upload your code, and AWS runs it in response to events -- no servers to manage, no capacity to provision, pay only for what you use.
+
+**How Lambda Works:**
+
+1. **Upload code**: Package your function (runtime + code + dependencies) as a ZIP or container image
+2. **Configure triggers**: Set up what invokes the function (API Gateway, S3, DynamoDB, CloudWatch, etc.)
+3. **AWS manages infrastructure**: Servers, scaling, patching, high availability
+4. **Pay per invocation**: You're charged for the number of requests + the duration of each request
+
+**Lambda Execution Model:**
+
+- **Cold Start**: First invocation after inactivity may take longer (200-500ms) while AWS provisions a runtime
+- **Warm Container**: Subsequent invocations reuse the same container (typically <10ms)
+- **Handler**: Your entry point function. Named `handler` by convention but can be anything you specify
+- **Context**: AWS passes a context object with info about the invocation (request ID, memory limit, etc.)
+
+**Lambda Configuration:**
+
+| Setting               | Range                    | Recommendation for Learning                          |
+| --------------------- | ------------------------ | ---------------------------------------------------- |
+| Memory                | 128 MB - 10 GB           | Start with 256-512 MB. More memory = more CPU + cost |
+| Timeout               | 1 - 900 seconds (15 min) | Start with 30 seconds for API handlers               |
+| Ephemeral Disk (/tmp) | 512 KB - 10 GB           | Only if you need file caching                        |
+| Concurrency           | 0 - (account limit)      | Default 1000 concurrent, can reserve                 |
+
+**Key Insight**: Memory also determines CPU allocation. At 1,769 MB, you get the equivalent of 1 vCPU. Above that, you get 2 vCPUs (Lambda scales CPU proportionally with memory).
+
+**Lambda Layers:**
+
+- Share common code/dependencies across functions
+- Upload once, reference in multiple functions
+- Use for: shared utilities, SDKs, logging libraries
+
+**Lambda Pricing (Free Tier):**
+
+- **Requests**: First 1,000,000 requests/month are free
+- **Duration**: First 400,000 GB-seconds/month are free
+- **Calculation**: (Memory in GB) × (Execution time in seconds) × (Requests)
+
+For learning: You will almost certainly stay within the free tier.
+
+**Runtimes:**
+
+Lambda supports many runtimes:
+
+- Node.js 20, 18 (LTS)
+- Python 3.11, 3.10, 3.9
+- Java 17, 11, 8
+- .NET 8, 7, 6
+- Go
+- Ruby 3.2
+
+We use **Node.js 20** for FitCloud.
+
+**Lambda + API Gateway Integration:**
+
+When Lambda is integrated with API Gateway, Lambda receives the HTTP request as the `event` parameter, and returns an HTTP response. This is called **Lambda Proxy Integration**.
+
+```typescript
+// event structure from API Gateway
+{
+  httpMethod: "GET",
+  path: "/workouts",
+  headers: { ... },
+  queryStringParameters: { ... },
+  body: "...",  // POST body as string
+  requestContext: {
+    authorizer: {
+      claims: {
+        sub: "user-id-123"  // From Cognito JWT!
+      }
+    }
+  }
+}
+```
+
+**The Lambda Handler Pattern:**
+
+```typescript
+export const handler = async (
+  event: APIGatewayProxyEvent,
+): Promise<APIGatewayProxyResult> => {
+  // Your code here
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ message: "Success" }),
+  };
+};
+```
+
+---
+
+#### Task 3.2: Lambda Functions & Backend Scaffolding
 
 **Status:** Pending
 
-#### Task 3.2: Lambda Functions
+**What you'll create:**
+
+1. Backend project structure (`package.json`, `tsconfig.json`)
+2. Lambda handler functions for CRUD operations
+3. Shared utilities (response helper, validation, DynamoDB client)
+4. Terraform for Lambda functions
+
+**Directory Structure:**
+
+```
+backend/
+├── package.json
+├── tsconfig.json
+├── jest.config.js
+├── src/
+│   ├── functions/
+│   │   ├── workouts/
+│   │   │   ├── create-workout.ts
+│   │   │   ├── list-workouts.ts
+│   │   │   ├── get-workout.ts
+│   │   │   ├── update-workout.ts
+│   │   │   └── delete-workout.ts
+│   │   └── types/
+│   │       └── workout.ts
+│   └── shared/
+│       ├── response.ts
+│       ├── validation.ts
+│       ├── dynamo.ts
+│       └── types.ts
+└── tests/
+```
+
+**How-to: 1. Create package.json**
+
+```json
+{
+  "name": "@fitcloud/backend",
+  "version": "1.0.0",
+  "description": "FitCloud Lambda functions",
+  "main": "dist/functions/workouts/create-workout.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.500.0",
+    "@aws-sdk/lib-dynamodb": "^3.500.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.0",
+    "@types/jest": "^29.0.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "jest": "^29.0.0",
+    "ts-jest": "^29.0.0",
+    "esbuild": "^0.20.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "eslint": "^8.0.0"
+  }
+}
+```
+
+**How-to: 2. Create tsconfig.json**
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "lib": ["ES2022"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "tests"]
+}
+```
+
+**How-to: 3. Shared Utilities**
+
+```typescript
+// src/shared/response.ts
+import type { APIGatewayProxyResult } from "aws-lambda";
+
+export const response = (
+  statusCode: number,
+  body: unknown,
+  headers?: Record<string, string>,
+): APIGatewayProxyResult => ({
+  statusCode,
+  headers: {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Credentials": true,
+    ...headers,
+  },
+  body: JSON.stringify(body),
+});
+```
+
+```typescript
+// src/shared/validation.ts
+import { z, ZodError } from "zod";
+
+export const validateInput = <T>(data: unknown, schema: z.ZodSchema<T>): T => {
+  try {
+    return schema.parse(data);
+  } catch (error) {
+    if (error instanceof ZodError) {
+      throw new ValidationError("Invalid input", error.errors);
+    }
+    throw error;
+  }
+};
+
+export class ValidationError extends Error {
+  constructor(
+    message: string,
+    public details: unknown,
+  ) {
+    super(message);
+    this.name = "ValidationError";
+  }
+}
+```
+
+```typescript
+// src/shared/dynamo.ts
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  QueryCommand,
+  GetCommand,
+  PutCommand,
+  UpdateCommand,
+  DeleteCommand,
+} from "@aws-sdk/lib-dynamodb";
+
+const client = new DynamoDBClient({});
+
+export const docClient = DynamoDBDocumentClient.from(client, {
+  marshallOptions: {
+    removeUndefinedValues: true,
+  },
+});
+
+export const TableName = process.env.WORKOUTS_TABLE || "fitcloud-workouts-dev";
+
+// Helper to build sort key patterns
+export const buildSortKey = (
+  entityType: string,
+  id: string,
+  subId?: string,
+): string => {
+  if (subId) {
+    return `${entityType}#${id}#${subId}`;
+  }
+  return `${entityType}#${id}`;
+};
+
+export const parseSortKey = (
+  sortKey: string,
+): { entityType: string; id: string; subId?: string } => {
+  const parts = sortKey.split("#");
+  return {
+    entityType: parts[0],
+    id: parts[1],
+    subId: parts[2],
+  };
+};
+```
+
+**How-to: 4. Lambda Handler: Create Workout**
+
+```typescript
+// src/functions/workouts/create-workout.ts
+import type { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
+import { z } from "zod";
+import { response } from "../../shared/response";
+import { validateInput, ValidationError } from "../../shared/validation";
+import { docClient, TableName, buildSortKey } from "../../shared/dynamo";
+import { PutCommand } from "@aws-sdk/lib-dynamodb";
+import { randomUUID } from "crypto";
+
+const workoutSchema = z.object({
+  name: z.string().min(1).max(100),
+  type: z.enum(["STRENGTH", "CARDIO", "FLEXIBILITY", "HIIT", "OTHER"]),
+  date: z.string(), // ISO date string
+  duration: z.number().min(0), // seconds
+  notes: z.string().max(1000).optional(),
+  exercises: z
+    .array(
+      z.object({
+        name: z.string().min(1),
+        order: z.number().int().positive(),
+        sets: z
+          .array(
+            z.object({
+              reps: z.number().int().min(0).optional(),
+              weight: z.number().min(0).optional(),
+              weightUnit: z.enum(["lbs", "kg"]).optional(),
+              duration: z.number().min(0).optional(), // seconds
+              completed: z.boolean().optional(),
+            }),
+          )
+          .optional(),
+      }),
+    )
+    .optional(),
+});
+
+export const handler = async (
+  event: APIGatewayProxyEvent,
+): Promise<APIGatewayProxyResult> => {
+  try {
+    // Extract userId from Cognito JWT (via API Gateway authorizer)
+    const userId = event.requestContext.authorizer?.claims?.sub;
+    if (!userId) {
+      return response(401, { error: "Unauthorized: No user ID" });
+    }
+
+    // Parse and validate request body
+    const body = JSON.parse(event.body || "{}");
+    const validated = validateInput(body, workoutSchema);
+
+    // Generate IDs and timestamps
+    const workoutId = randomUUID();
+    const now = new Date().toISOString();
+    const timestamp = Math.floor(Date.now() / 1000);
+
+    // Build the workout item
+    const workoutItem = {
+      userId: `USER#${userId}`,
+      sortKey: buildSortKey("WORKOUT", workoutId, timestamp.toString()),
+      entityType: "WORKOUT",
+      workoutId,
+      userIdOnly: userId, // For GSI if needed
+      ...validated,
+      status: "IN_PROGRESS",
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    // Save to DynamoDB
+    await docClient.send(
+      new PutCommand({
+        TableName,
+        Item: workoutItem,
+      }),
+    );
+
+    return response(201, {
+      workoutId,
+      message: "Workout created successfully",
+    });
+  } catch (error) {
+    console.error("Error creating workout:", error);
+
+    if (error instanceof ValidationError) {
+      return response(400, { error: error.message, details: error.details });
+    }
+
+    return response(500, { error: "Internal server error" });
+  }
+};
+```
+
+**How-to: 5. Lambda Handler: List Workouts**
+
+```typescript
+// src/functions/workouts/list-workouts.ts
+import type { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
+import { response } from "../../shared/response";
+import { docClient, TableName } from "../../shared/dynamo";
+import { QueryCommand } from "@aws-sdk/lib-dynamodb";
+
+export const handler = async (
+  event: APIGatewayProxyEvent,
+): Promise<APIGatewayProxyResult> => {
+  try {
+    const userId = event.requestContext.authorizer?.claims?.sub;
+    if (!userId) {
+      return response(401, { error: "Unauthorized: No user ID" });
+    }
+
+    // Parse query parameters for pagination
+    const limit = event.queryStringParameters?.limit
+      ? parseInt(event.queryStringParameters.limit)
+      : 20;
+    const lastKey = event.queryStringParameters?.lastKey
+      ? JSON.parse(
+          Buffer.from(event.queryStringParameters.lastKey, "base64").toString(),
+        )
+      : undefined;
+
+    // Query DynamoDB for user's workouts
+    const result = await docClient.send(
+      new QueryCommand({
+        TableName,
+        KeyConditionExpression:
+          "userId = :userId AND begins_with(sortKey, :prefix)",
+        ExpressionAttributeValues: {
+          ":userId": `USER#${userId}`,
+          ":prefix": "WORKOUT#",
+        },
+        Limit: limit,
+        ExclusiveStartKey: lastKey,
+        ScanIndexForward: false, // Descending order (newest first)
+      }),
+    );
+
+    // Transform items for response
+    const workouts = (result.Items || []).map((item) => ({
+      workoutId: item.workoutId,
+      name: item.name,
+      type: item.type,
+      date: item.date,
+      duration: item.duration,
+      status: item.status,
+      createdAt: item.createdAt,
+    }));
+
+    // Build pagination token
+    const nextToken = result.LastEvaluatedKey
+      ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString("base64")
+      : undefined;
+
+    return response(200, { workouts, nextToken });
+  } catch (error) {
+    console.error("Error listing workouts:", error);
+    return response(500, { error: "Internal server error" });
+  }
+};
+```
+
+**How-to: 6. Lambda Handler: Get Workout**
+
+```typescript
+// src/functions/workouts/get-workout.ts
+import type { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
+import { response } from "../../shared/response";
+import { docClient, TableName } from "../../shared/dynamo";
+import { GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
+
+export const handler = async (
+  event: APIGatewayProxyEvent,
+): Promise<APIGatewayProxyResult> => {
+  try {
+    const userId = event.requestContext.authorizer?.claims?.sub;
+    if (!userId) {
+      return response(401, { error: "Unauthorized: No user ID" });
+    }
+
+    const workoutId = event.pathParameters?.id;
+    if (!workoutId) {
+      return response(400, { error: "Missing workout ID" });
+    }
+
+    // Get workout details
+    const workoutResult = await docClient.send(
+      new QueryCommand({
+        TableName,
+        KeyConditionExpression: "userId = :userId AND sortKey = :sortKey",
+        ExpressionAttributeValues: {
+          ":userId": `USER#${userId}`,
+          ":sortKey": `WORKOUT#${workoutId}`,
+        },
+      }),
+    );
+
+    const workout = workoutResult.Items?.[0];
+    if (!workout) {
+      return response(404, { error: "Workout not found" });
+    }
+
+    // Get exercises for this workout
+    const exercisesResult = await docClient.send(
+      new QueryCommand({
+        TableName,
+        KeyConditionExpression:
+          "userId = :userId AND begins_with(sortKey, :prefix)",
+        ExpressionAttributeValues: {
+          ":userId": `USER#${userId}`,
+          ":prefix": `EXERCISE#${workoutId}`,
+        },
+      }),
+    );
+
+    return response(200, {
+      ...workout,
+      exercises: exercisesResult.Items || [],
+    });
+  } catch (error) {
+    console.error("Error getting workout:", error);
+    return response(500, { error: "Internal server error" });
+  }
+};
+```
+
+**How-to: 7. Terraform for Lambda Functions**
+
+```hcl
+# terraform/modules/lambda/main.tf
+
+# 1. IAM Role for Lambda execution
+resource "aws_iam_role" "lambda_exec" {
+  name = "${var.project_name}-lambda-exec-${var.environment}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+}
+
+# 2. Attach basic execution role (CloudWatch Logs)
+resource "aws_iam_role_policy_attachment" "lambda_basic" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# 3. Custom policy for DynamoDB access
+resource "aws_iam_policy" "lambda_dynamodb" {
+  name = "${var.project_name}-lambda-dynamodb-${var.environment}"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:Scan"
+        ]
+        Resource = [
+          var.dynamodb_table_arn,
+          "${var.dynamodb_table_arn}/index/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:ListTables"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_dynamodb" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = aws_iam_policy.lambda_dynamodb.arn
+}
+
+# 4. Lambda functions (one per handler)
+resource "aws_lambda_function" "create_workout" {
+  filename         = "../../../backend/dist/functions/workouts/create-workout.zip"
+  source_code_hash = filebase64sha256("../../../backend/dist/functions/workouts/create-workout.zip")
+
+  function_name = "${var.project_name}-create-workout-${var.environment}"
+  description    = "Create a new workout"
+  handler        = "functions/workouts/create-workout.handler"
+
+  runtime     = "nodejs20.x"
+  timeout      = 30
+  memory_size = 256
+
+  role = aws_iam_role.lambda_exec.arn
+
+  environment {
+    variables = {
+      WORKOUTS_TABLE = var.dynamodb_table_name
+    }
+  }
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+  }
+}
+
+# Repeat for list-workouts, get-workout, update-workout, delete-workout
+```
+
+**Lessons Learned:**
+
+- Initialize AWS SDK clients **outside** the handler (reused across invocations)
+- Use Zod for runtime validation of incoming JSON
+- Always extract `userId` from `event.requestContext.authorizer.claims.sub` -- this is set by Cognito authorizer
+- Return proper HTTP status codes: 201 for created, 200 for success, 400 for bad request, 401 for unauthorized, 404 for not found, 500 for errors
+- Use UUIDs for unique IDs, timestamps for sort keys
+
+**Study Questions:**
+
+- Why should AWS SDK clients be initialized outside the Lambda handler?
+- What is the difference between GetItem and Query in DynamoDB?
+- How does the Cognito authorizer pass the user ID to Lambda?
+- What happens if you don't validate input with Zod?
+
+**Resources:**
+
+- [Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html)
+- [Lambda Pricing](https://aws.amazon.com/lambda/pricing/)
+- [AWS SDK for JavaScript v3](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/welcome.html)
+- [Zod Validation](https://zod.dev/)
+
+---
+
+#### Key Concepts: Amazon API Gateway
+
+**What is API Gateway?**
+API Gateway is AWS's fully managed service for creating, publishing, maintaining, and securing APIs. It acts as the "front door" for your backend services -- accepting API requests, enforcing security, routing to backend services, and returning responses.
+
+**REST API vs HTTP API:**
+
+| Feature                  | REST API               | HTTP API               |
+| ------------------------ | ---------------------- | ---------------------- |
+| Cost                     | $3.50/million requests | $1.00/million requests |
+| Features                 | Full API management    | Lightweight, modern    |
+| Request/Response Mapping | Yes                    | No (simpler)           |
+| API Key Support          | Yes                    | No                     |
+| Usage Plans              | Yes                    | No                     |
+| Request Validation       | Yes                    | No                     |
+| AWS WAF Integration      | Yes                    | No                     |
+
+For FitCloud: We use **REST API** because it has more CCP-relevant features and supports request validation.
+
+**API Gateway Components:**
+
+1. **REST API**: The container for your API
+2. **Resource**: A path in your URL hierarchy (e.g., `/workouts`, `/workouts/{id}`)
+3. **Method**: HTTP verb (GET, POST, PUT, DELETE, PATCH, OPTIONS)
+4. **Integration**: Where the request goes (Lambda, HTTP, AWS service, mock)
+5. **Stage**: A deployable version (e.g., `dev`, `prod`)
+6. **Deployment**: A snapshot of the API configuration
+7. **Authorizer**: Validates tokens (Cognito, Lambda)
+8. **API Key**: For meter tracking
+
+**CORS (Cross-Origin Resource Sharing):**
+
+CORS is critical for React SPAs. Without proper CORS headers:
+
+- Browser blocks frontend JavaScript from calling your API from a different origin
+- `localhost:5173` (frontend) can't call `execute-api.us-east-1.amazonaws.com` (API)
+
+You need to configure:
+
+1. **OPTIONS method** on each resource (preflight handling)
+2. **Response headers**:
+   - `Access-Control-Allow-Origin: *` (or your domain)
+   - `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
+   - `Access-Control-Allow-Headers: Content-Type, Authorization`
+
+**API Gateway + Lambda Integration:**
+
+When API Gateway receives a request, it can invoke Lambda. This is called **Lambda Proxy Integration**:
+
+```
+User -> API Gateway -> Lambda (handler) -> DynamoDB
+                                    <- Response <-
+```
+
+The Lambda function receives the full HTTP request and returns an HTTP response.
+
+**Throttling and Rate Limiting:**
+
+- **Burst Limit**: Maximum requests per second (default: 10,000 for REST API)
+- **Rate Limit**: Requests per second (default: 5,000)
+- **Usage Plans**: Track usage by API key (we won't use this)
+
+---
+
+#### Task 3.3: API Gateway Setup
 
 **Status:** Pending
 
-#### Task 3.3: API Gateway
+**What you'll create:**
+
+1. API Gateway REST API
+2. Resources for `/workouts` and `/workouts/{id}`
+3. Methods (GET, POST, PUT, DELETE) for each resource
+4. Lambda integrations for each method
+5. Cognito authorizer (connect to existing User Pool from Module 2)
+6. CORS configuration
+7. Deployment and stage
+
+**API Design:**
+
+| Method | Path             | Lambda Function | Description        |
+| ------ | ---------------- | --------------- | ------------------ |
+| POST   | `/workouts`      | create-workout  | Create a workout   |
+| GET    | `/workouts`      | list-workouts   | List all workouts  |
+| GET    | `/workouts/{id}` | get-workout     | Get single workout |
+| PUT    | `/workouts/{id}` | update-workout  | Update workout     |
+| DELETE | `/workouts/{id}` | delete-workout  | Delete workout     |
+
+**Terraform resources used:**
+
+| Resource                      | Purpose             |
+| ----------------------------- | ------------------- |
+| `aws_api_gateway_rest_api`    | The API             |
+| `aws_api_gateway_resource`    | Path resources      |
+| `aws_api_gateway_method`      | HTTP methods        |
+| `aws_api_gateway_integration` | Lambda integration  |
+| `aws_api_gateway_authorizer`  | Cognito authorizer  |
+| `aws_api_gateway_deployment`  | Deploy the API      |
+| `aws_api_gateway_stage`       | Stage configuration |
+
+**How-to:**
+
+1. **Create the REST API**
+
+   ```hcl
+   resource "aws_api_gateway_rest_api" "main" {
+     name        = "${var.project_name}-api-${var.environment}"
+     description = "FitCloud REST API"
+   }
+   ```
+
+2. **Create `/workouts` resource**
+
+   ```hcl
+   resource "aws_api_gateway_resource" "workouts" {
+     rest_api_id = aws_api_gateway_rest_api.main.id
+     parent_id   = aws_api_gateway_rest_api.main.root_resource_id
+     path_part   = "workouts"
+   }
+   ```
+
+3. **Create `/workouts/{id}` resource** (for single-item operations)
+
+   ```hcl
+   resource "aws_api_gateway_resource" "workout_id" {
+     rest_api_id = aws_api_gateway_rest_api.main.id
+     parent_id   = aws_api_gateway_resource.workouts.id
+     path_part   = "{id}"
+   }
+   ```
+
+4. **Create Cognito Authorizer** (connect to Module 2's User Pool)
+
+   ```hcl
+   resource "aws_api_gateway_authorizer" "cognito" {
+     name                   = "${var.project_name}-authorizer-${var.environment}"
+     rest_api_id           = aws_api_gateway_rest_api.main.id
+     type                   = "COGNITO_USER_POOLS"
+     provider_arns         = [var.cognito_user_pool_arn]
+     authorizer_result_ttl_in_seconds = 300
+   }
+   ```
+
+5. **Create methods with authorizer** (example: POST /workouts)
+
+   ```hcl
+   resource "aws_api_gateway_method" "workouts_post" {
+     rest_api_id   = aws_api_gateway_rest_api.main.id
+     resource_id   = aws_api_gateway_resource.workouts.id
+     http_method   = "POST"
+     authorization = "COGNITO_USER_POOLS"
+     authorizer_id = aws_api_gateway_authorizer.cognito.id
+   }
+   ```
+
+6. **Create Lambda integration**
+
+   ```hcl
+   resource "aws_api_gateway_integration" "workouts_post_lambda" {
+     rest_api_id = aws_api_gateway_rest_api.main.id
+     resource_id = aws_api_gateway_resource.workouts.id
+     http_method = aws_api_gateway_method.workouts_post.http_method
+
+     integration_http_method = "POST"
+     type                     = "AWS_PROXY"  # Lambda proxy integration
+     uri                      = aws_lambda_function.create_workout.invoke_arn
+   }
+   ```
+
+7. **Add CORS configuration** (OPTIONS method on each resource)
+
+   ```hcl
+   resource "aws_api_gateway_method" "workouts_options" {
+     rest_api_id   = aws_api_gateway_rest_api.main.id
+     resource_id   = aws_api_gateway_resource.workouts.id
+     http_method   = "OPTIONS"
+     authorization = "NONE"
+   }
+
+   resource "aws_api_gateway_integration" "workouts_options_cors" {
+     rest_api_id = aws_api_gateway_rest_api.main.id
+     resource_id = aws_api_gateway_resource.workouts.id
+     http_method = "OPTIONS"
+
+     type = "MOCK"
+     response_parameters = {
+       "method.response.header.Access-Control-Allow-Origin"  = "'*'",
+       "method.response.header.Access-Control-Allow-Methods" = "'GET,POST,OPTIONS'",
+       "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,Authorization'"
+     }
+     response_template = ""
+   }
+   ```
+
+8. **Deploy the API**
+
+   ```hcl
+   resource "aws_api_gateway_deployment" "main" {
+     rest_api_id = aws_api_gateway_rest_api.main.id
+
+     depends_on = [
+       aws_api_gateway_integration.workouts_post_lambda,
+       # ... other integrations
+     ]
+   }
+
+   resource "aws_api_gateway_stage" "dev" {
+     deployment_id = aws_api_gateway_deployment.main.id
+     rest_api_id  = aws_api_gateway_rest_api.main.id
+     stage_name   = "dev"
+   }
+   ```
+
+9. **Add Lambda permission** (allow API Gateway to invoke Lambda)
+   ```hcl
+   resource "aws_lambda_permission" "api_gateway" {
+     statement_id  = "AllowExecutionFromApiGateway"
+     action        = "lambda:InvokeFunction"
+     function_name = aws_lambda_function.create_workout.function_name
+     principal     = "apigateway.amazonaws.com"
+     source_arn    = "${aws_api_gateway_rest_api.main.execution_arn}/*/*"
+   }
+   ```
+
+**Lessons Learned:**
+
+- REST API uses `AWS_PROXY` integration for Lambda -- Lambda returns the full HTTP response
+- The `authorizer_id` on each method connects to Cognito User Pool
+- CORS is mandatory for browser clients -- OPTIONS method handles preflight requests
+- API must be **deployed** before it can be accessed -- deployment creates a stage
+- `depends_on` ensures integrations are ready before deployment
+
+**Code Snippets:**
+
+```bash
+# Get the API endpoint after deployment
+aws apigateway get-stage --rest-api-id <API_ID> --stage-name dev
+
+# Test the API (after getting JWT token)
+curl -X POST https://<API_ID>.execute-api.us-east-1.amazonaws.com/dev/workouts \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -d '{"name":"Morning Workout","type":"STRENGTH","date":"2025-01-01","duration":3600}'
+
+# List workouts
+curl -X GET https://<API_ID>.execute-api.us-east-1.amazonaws.com/dev/workouts \
+  -H "Authorization: Bearer <JWT_TOKEN>"
+```
+
+**Study Questions:**
+
+- What is the difference between REST API and HTTP API in API Gateway?
+- Why is CORS configuration needed for a React SPA?
+- How does Cognito authorizer protect API Gateway endpoints?
+- What is Lambda proxy integration?
+
+**Resources:**
+
+- [API Gateway Developer Guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/welcome.html)
+- [API Gateway Pricing](https://aws.amazon.com/api-gateway/pricing/)
+- [Terraform aws_api_gateway_rest_api](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/api_gateway_rest_api)
+
+---
+
+#### Key Concepts: IAM Roles for Lambda
+
+**Why IAM Roles Matter Here:**
+
+In Module 0, you learned about IAM users, groups, roles, and policies. Now you're applying that knowledge:
+
+- Lambda functions need permissions to access DynamoDB
+- Instead of embedding credentials, Lambda **assumes an IAM role**
+- The role's permission policy defines what DynamoDB operations are allowed
+
+**Trust Policy:**
+
+Every IAM role has a trust policy (who can assume the role):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "lambda.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+This says: "Lambda service can assume this role."
+
+**Permission Policy:**
+
+The permission policy defines what actions are allowed:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"],
+      "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/fitcloud-workouts-dev"
+    }
+  ]
+}
+```
+
+This says: "The role can read/write/query the workouts table."
+
+**Managed vs Custom Policies:**
+
+- **Managed Policies**: Created by AWS, reusable (e.g., `AWSLambdaBasicExecutionRole`)
+- **Custom Policies**: Created by you, specific to your application
+
+For Lambda, we typically:
+
+1. Attach `AWSLambdaBasicExecutionRole` (managed) for CloudWatch Logs
+2. Attach a custom policy for DynamoDB access
+
+**Principle of Least Privilege:**
+
+The permission policy should only grant the minimum access needed:
+
+- ✅ `dynamodb:GetItem` on specific table
+- ❌ `dynamodb:*` on all tables (`*` is too broad)
+- ❌ `dynamodb:GetItem` on `*` (any table)
+
+**Exam Tip**: The CCP exam tests whether you understand least privilege.
+
+---
+
+#### Task 3.4: IAM Role & Permission Policy
 
 **Status:** Pending
+
+**What you'll create:**
+
+1. IAM role for Lambda execution (trust policy)
+2. Managed policy attachment for CloudWatch Logs
+3. Custom IAM policy for DynamoDB access
+4. Lambda permission to allow API Gateway invocation
+
+**This task is already included in the Terraform from Task 3.2!**
+
+See the Terraform code in Task 3.2 (`aws_iam_role`, `aws_iam_policy`, `aws_iam_role_policy_attachment`).
+
+The key components:
+
+```hcl
+# Trust policy (in aws_iam_role resource)
+assume_role_policy = jsonencode({
+  Version = "2012-10-17"
+  Statement = [{
+    Action = "sts:AssumeRole"
+    Effect = "Allow"
+    Principal = {
+      Service = "lambda.amazonaws.com"
+    }
+  }]
+})
+
+# Permission policy (in aws_iam_policy resource)
+policy = jsonencode({
+  Version = "2012-10-17"
+  Statement = [{
+    Effect = "Allow"
+    Action = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:Query",
+      "dynamodb:Scan"
+    ]
+    Resource = [
+      var.dynamodb_table_arn,
+      "${var.dynamodb_table_arn}/index/*"
+    ]
+  }]
+})
+```
+
+**Lessons Learned:**
+
+- IAM role = trust policy + permission policy
+- Trust policy: "who can assume this role" (Lambda service)
+- Permission policy: "what can this role do" (DynamoDB operations)
+- Always scope DynamoDB permissions to specific table ARN
+- Use managed policies for common needs (CloudWatch Logs)
+
+**Study Questions:**
+
+- between a trust policy What is the difference and a permission policy?
+- Why should DynamoDB permissions be scoped to specific tables?
+- What managed policy is needed for Lambda to write CloudWatch Logs?
+
+---
+
+#### Task 3.5: End-to-End Testing & Deployment
+
+**Status:** Pending
+
+**What you'll create:**
+
+1. Deploy all Module 3 resources via Terraform
+2. Test the full authentication + API flow
+3. Verify data in DynamoDB
+
+**Deployment Workflow:**
+
+```bash
+cd terraform/envs/dev
+
+# 1. Add the new modules to envs/dev/main.tf
+# (Add module "dynamodb", module "lambda", module "api_gateway")
+
+# 2. Format code
+terraform fmt -recursive
+
+# 3. Validate syntax
+terraform validate
+
+# 4. Preview changes
+terraform plan
+
+# 5. Apply (creates real AWS resources)
+terraform apply
+
+# 6. Note outputs
+# - API endpoint URL
+# - DynamoDB table name
+```
+
+**Manual Testing Flow:**
+
+1. **Get JWT Token** (via Cognito Hosted UI):
+   - Visit: `https://<your-domain>.auth.us-east-1.amazoncognito.com/login?client_id=<client-id>&response_type=code&scope=openid+profile&redirect_uri=http://localhost:5173`
+   - Sign up / Sign in
+   - Copy the authorization code from the redirect URL
+
+2. **Exchange code for tokens** (using Amplify or manually):
+
+   ```bash
+   curl -X POST https://<your-domain>.auth.us-east-1.amazoncognito.com/oauth2/token \
+     -H "Content-Type: application/x-www-form-urlencoded" \
+     -d "grant_type=authorization_code" \
+     -d "client_id=<client-id>" \
+     -d "code=<auth-code>" \
+     -d "redirect_uri=http://localhost:5173"
+   ```
+
+3. **Test API endpoints**:
+
+   ```bash
+   # Replace <TOKEN> with your actual access_token
+   TOKEN="eyJraWQiOi..."
+
+   # Create a workout
+   curl -X POST https://<API_ID>.execute-api.us-east-1.amazonaws.com/dev/workouts \
+     -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $TOKEN" \
+     -d '{"name":"Morning Workout","type":"STRENGTH","date":"2025-01-01","duration":3600}'
+
+   # List workouts
+   curl -X GET https://<API_ID>.execute-api.us-east-1.amazonaws.com/dev/workouts \
+     -H "Authorization: Bearer $TOKEN"
+
+   # Get specific workout (replace <WORKOUT_ID>)
+   curl -X GET https://<API_ID>.execute-api.us-east-1.amazonaws.com/dev/workouts/<WORKOUT_ID> \
+     -H "Authorization: Bearer $TOKEN"
+   ```
+
+4. **Verify in DynamoDB**:
+
+   ```bash
+   # Scan table (dev only - not for production!)
+   aws dynamodb scan --table-name fitcloud-workouts-dev
+
+   # Query specific user's workouts
+   aws dynamodb query \
+     --table-name fitcloud-workouts-dev \
+     --key-condition-expression "userId = :uid" \
+     --expression-attribute-values '{":uid":{"S":"USER#<user-id>"}}'
+   ```
+
+**Verification Checklist:**
+
+- [ ] DynamoDB table exists with correct name
+- [ ] Lambda functions deployed with correct runtime (nodejs20.x)
+- [ ] Lambda execution role has DynamoDB permissions
+- [ ] API Gateway REST API created
+- [ ] All routes mapped to Lambda functions (/workouts, /workouts/{id})
+- [ ] Cognito authorizer attached to methods
+- [ ] CORS configured (OPTIONS methods return correct headers)
+- [ ] API deployed to dev stage
+- [ ] API responds to requests
+- [ ] Unauthenticated requests return 401
+- [ ] Authenticated requests return workout data
+- [ ] Data appears in DynamoDB
+
+**Common Mistakes to Avoid:**
+
+1. **Forgetting Lambda permissions**: API Gateway returns 500 if Lambda can't access DynamoDB
+2. **Missing CORS**: Browser JavaScript requests fail without OPTIONS methods
+3. **Wrong authorizer type**: Use `COGNITO_USER_POOLS`, not `REQUEST` for simple Cognito
+4. **Not deploying the API**: Changes don't take effect until you create a deployment
+5. **Missing `depends_on`**: API deployment may fail if integrations aren't ready
+6. **Wrong path parameters**: `{id}` in API Gateway becomes `event.pathParameters.id` in Lambda
+7. **JSON parse errors**: Remember `event.body` is a string, must JSON.parse()
+8. **Wrong JWT claim**: Cognito puts user ID in `event.requestContext.authorizer.claims.sub`
+
+**Architecture Diagram (Full Module 3):**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          FITCLOUD ARCHITECTURE                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌──────────┐      ┌──────────────────┐      ┌──────────────────┐      │
+│  │  React   │──────▶│  API Gateway    │──────▶│    Lambda        │      │
+│  │  Frontend│      │  REST API        │      │  (Node.js 20)   │      │
+│  └──────────┘      └────────┬─────────┘      └────────┬─────────┘      │
+│       │                     │                       │                  │
+│       │ JWT Bearer         │                       │                  │
+│       │ Token             │                       ▼                  │
+│       ▼                   │              ┌──────────────────┐          │
+│  ┌──────────────┐        │              │    DynamoDB     │          │
+│  │  Cognito     │◀───────┘              │  (Single-table) │          │
+│  │  User Pool   │                       └──────────────────┘          │
+│  │  (Auth)      │                       │  PK: userId              │
+│  └──────────────┘                       │  SK: sortKey             │
+│                                          │                            │
+│  Cognito validates JWT,                   │                            │
+│  API Gateway authorizes                   │                            │
+│  Lambda receives userId                    │                            │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Module 3 Deployment Workflow
+
+```bash
+# Navigate to terraform
+cd terraform/envs/dev
+
+# 1. Add new modules to main.tf (see Task 3.1-3.4 for module code)
+# - module "dynamodb" { source = "../../modules/dynamodb" ... }
+# - module "lambda" { source = "../../modules/lambda" ... }
+# - module "api_gateway" { source = "../../modules/api-gateway" ... }
+
+# 2. Format code
+terraform fmt -recursive
+
+# 3. Validate syntax
+terraform validate
+
+# 4. Preview what will be created
+terraform plan
+
+# 5. Apply (creates real AWS resources)
+terraform apply
+
+# 6. Build and deploy Lambda functions
+# (First build the TypeScript, then update Lambda)
+cd ../../backend
+npm install
+npm run build
+
+# 7. Update Lambda functions with new code
+aws lambda update-function-code \
+  --function-name fitcloud-create-workout-dev \
+  --zip-file fileb://dist/functions/workouts/create-workout.zip
+
+# (Repeat for other Lambda functions)
+
+# 8. Test the API
+# See testing section above
+```
+
+---
+
+#### Module 3 Verification Checklist
+
+- [ ] DynamoDB table `fitcloud-workouts-dev` exists
+- [ ] Table uses on-demand billing (PAY_PER_REQUEST)
+- [ ] Lambda functions deployed: create-workout, list-workouts, get-workout, update-workout, delete-workout
+- [ ] Lambda execution role has DynamoDB permissions
+- [ ] API Gateway REST API exists
+- [ ] All 5 routes mapped: POST/GET /workouts, GET/PUT/DELETE /workouts/{id}
+- [ ] Cognito authorizer attached to all methods
+- [ ] CORS configured (OPTIONS methods present)
+- [ ] API deployed to `dev` stage
+- [ ] Unauthenticated request returns 401
+- [ ] Authenticated request with valid JWT returns workout data
+- [ ] Workout created appears in DynamoDB
+
+---
+
+#### AWS Cloud Practitioner Exam Topics Covered
+
+| Exam Domain    | Topic from this module                                                                                  |
+| -------------- | ------------------------------------------------------------------------------------------------------- |
+| Technology     | DynamoDB (NoSQL, single-table, on-demand), Lambda (serverless, pricing), API Gateway (REST API, stages) |
+| Security       | IAM roles for Lambda, least privilege policies, Cognito JWT authorization                               |
+| Cloud Concepts | Serverless computing, managed services, event-driven architecture                                       |
+| Billing        | DynamoDB on-demand ($0.25/million), Lambda free tier (1M requests), API Gateway free tier (1M requests) |
+
+**Key Exam Points:**
+
+- DynamoDB is a fully managed NoSQL service
+- Lambda runs code without provisioning servers
+- API Gateway manages API access and security
+- Serverless means you don't manage the underlying compute
+- All three services have generous free tiers for learning
+
+---
+
+#### Common Mistakes to Avoid
+
+1. **Forgetting to deploy API Gateway** -- API changes don't work until deployed
+2. **Missing CORS configuration** -- React SPA requests will fail
+3. **Wrong userId extraction** -- Cognito authorizer puts it in `event.requestContext.authorizer.claims.sub`
+4. **Using wrong DynamoDB SDK** -- Use `@aws-sdk/lib-dynamodb` for document client
+5. **Not handling JSON parse errors** -- `event.body` is always a string
+6. **Overly permissive IAM policies** -- Always scope to specific table ARN
+7. **Missing Lambda permission** -- API Gateway can't invoke Lambda without it
+8. **Using provisioned capacity** -- Stay with on-demand for free tier
 
 ---
 
