@@ -11,5 +11,14 @@ output "user_pull_client_id" {
 output "user_pull_domain_id" {
   description = "Cognito user pull domain id"
   value       = aws_cognito_user_pool_domain.domain.domain
+}
 
+output "cognito_user_pool_endpoint" {
+  description = "Cognito User Pool endpoint"
+  value       = aws_cognito_user_pool.main.endpoint
+}
+
+output "cognito_hosted_ui_url" {
+  description = "Cognito Hosted UI URL"
+  value       = "https://${aws_cognito_user_pool_domain.domain.domain}.auth.${var.aws_region}.amazoncognito.com"
 }
