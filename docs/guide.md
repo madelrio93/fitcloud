@@ -93,8 +93,8 @@
 **How-to:**
 
 1. **Enable MFA on root account**
-   - Go to AWS Console → IAM → Users → Select root account
-   - Navigate to Security credentials
+   - Go to AWS Console → Click your account name (top-right) → Security credentials
+   - Or navigate directly to https://console.aws.amazon.comIAMv2#/security_credentials
    - Click "Assign MFA device"
    - Choose "Virtual MFA device"
    - Use Google Authenticator or Authy to scan QR code
@@ -121,6 +121,128 @@
 - Root MFA is critical - no CLI access needed for root
 - Create separate IAM users for each use case
 - Store access keys securely - never commit to git
+
+---
+
+#### Understanding IAM: Users, Groups, Roles & Policies
+
+IAM (Identity and Access Management) is how you control **who** can access **what** in your AWS account. There are four core concepts you need to understand:
+
+**IAM Users:**
+
+- Represents a **single person** or application
+- Has permanent credentials (access key + secret key, or console password)
+- Best practice: One user per person; use IAM roles for applications
+- Example: Your personal admin user for daily work
+
+**IAM Groups:**
+
+- A collection of IAM users
+- Used to apply the same permissions to multiple users easily
+- Example: A "Developers" group that all developer accounts belong to
+- Best practice: Use groups to manage permissions at scale
+
+**IAM Roles:**
+
+- A set of temporary permissions that can be assumed by anyone who needs them
+- No permanent credentials -- you "assume" a role to get temporary credentials
+- Used for: Cross-account access, EC2/Lambda service access, federated users
+- Example: A "LambdaExecutionRole" that your Lambda functions assume to access DynamoDB
+
+**IAM Policies:**
+
+- JSON documents that define **what actions are allowed or denied**
+- Can be attached to: Users, Groups, or Roles
+- Two types:
+  - **Managed policies**: Reusable, created by AWS (e.g., `AdministratorAccess`) or you
+  - **Inline policies**: Embedded directly in a single user/group/role
+
+**The Relationship:**
+
+```
+IAM User ──belongs to──▶ IAM Group ──has attached──▶ IAM Policy(ies)
+                                │
+                                └──can also assume──▶ IAM Role ──has attached──▶ IAM Policy(ies)
+```
+
+**For FitCloud:**
+
+- We create an IAM user (`admin`) for you to access the AWS Console and CLI
+- We DON'T create IAM roles yet -- we'll add those when we create Lambda functions (Module 3)
+- We'll use AWS managed policies like `AdministratorAccess` for learning simplicity
+
+**Study Questions:**
+
+- What's the difference between an IAM user and an IAM role? When would you use each?
+- Why is it better to attach policies to groups rather than individual users?
+- What happens if you attach both an Allow and Deny policy to the same user?
+- Can an IAM role have a permanent password? Why or why not?
+
+**Resources:**
+
+- [IAM Best Practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html)
+- [IAM Identities](https://docs.aws.amazon.com/IAM/latest/UserGuide/id.html)
+
+---
+
+#### The AWS Shared Responsibility Model
+
+The Shared Responsibility Model is one of the **most important concepts** in AWS -- and one of the most frequently tested topics on the AWS Cloud Practitioner exam. It defines what AWS manages versus what **you** manage.
+
+**The Simple Breakdown:**
+
+| What AWS Manages                                                 | What You Manage                                         |
+| ---------------------------------------------------------------- | ------------------------------------------------------- |
+| **Physical infrastructure** (data centers, servers, networking)  | **Your data** (what you store in S3, DynamoDB, RDS)     |
+| **Hypervisor & hardware**                                        | **Your IAM configuration** (users, roles, policies)     |
+| **Region/AZ infrastructure**                                     | **Your application code**                               |
+| **Foundational services** (EC2, S3, DynamoDB core functionality) | **Operating systems** (on EC2, if you use it)           |
+| **AWS global infrastructure** (Route 53, IAM, CloudFront)        | **Network configuration** (security groups, NACLs, VPC) |
+
+**Security IN the Cloud vs. OF the Cloud:**
+
+AWS uses two phrases that can be confusing:
+
+- **Security OF the Cloud** (AWS's responsibility): AWS secures the infrastructure _itself_ -- the data centers, hardware, virtualization layer, and foundational services. This is always AWS's job.
+
+- **Security IN the Cloud** (your responsibility): _You_ are responsible for how you _use_ AWS services. This includes:
+  - Your data access (who can see what's in your S3 bucket?)
+  - Your IAM policies (are you following least privilege?)
+  - Your application code (does it have vulnerabilities?)
+  - Your configuration (are your security groups too open?)
+
+**Examples by Service (What You vs. AWS Manage):**
+
+| Service      | AWS Manages                                                    | You Manage                                                        |
+| ------------ | -------------------------------------------------------------- | ----------------------------------------------------------------- |
+| **S3**       | Physical durability (11 nines), infrastructure, server patches | Bucket policies, access controls, encryption settings, versioning |
+| **Cognito**  | User pool infrastructure, token signing, MFA infrastructure    | User pool configuration, app client settings, password policies   |
+| **Lambda**   | Compute infrastructure, runtime execution, scaling             | Function code, environment variables, IAM execution role          |
+| **DynamoDB** | Server infrastructure, data durability, automatic scaling      | Table design (partition keys), access via IAM, encryption at rest |
+
+**The Rule of Thumb:**
+
+> If you can configure it, you own it. If you can't configure it (like data center physical security), AWS owns it.
+
+**Why This Matters for the Exam:**
+
+The CCP exam _will_ ask you questions like:
+
+- "Who is responsible for patching the operating system on an EC2 instance?" (You)
+- "Who is responsible for the physical security of S3 data centers?" (AWS)
+- "Who manages access to objects in an S3 bucket?" (You)
+
+**Study Questions:**
+
+- Is AWS responsible for data loss in S3 if you accidentally delete objects? Why or why not?
+- If you deploy a Lambda function, who manages the underlying server it runs on?
+- Can AWS access your S3 data without your permission? Under what circumstances?
+- Who's responsible for encrypting data in DynamoDB -- AWS or you?
+
+**Resources:**
+
+- [AWS Shared Responsibility Model](https://aws.amazon.com/compliance/shared-responsibility-model/)
+- [Security in AWS](https://docs.aws.amazon.com/whitepapers/latest/aws-overview/security.html)
 
 **Code Snippets:**
 
@@ -247,8 +369,9 @@ aws sts get-caller-identity
 
 **Lessons Learned:**
 
-- CloudTrail is free for the first 90 days per trail
-- Event history shows last 90 days
+- CloudTrail **management events** (API calls) are free for **one trail per region** -- this trail can log to all regions
+- CloudTrail **Event history** (the console view) is always free and shows the last 90 days of management events
+- Additional trails, or trails that include **data events** (S3 object-level, Lambda invocation details), cost money
 - Enable log file integrity validation to detect tampering
 
 ---
@@ -263,7 +386,7 @@ aws sts get-caller-identity
    - S3 → Create bucket
    - Bucket name: `fitcloud-terraform-state-<unique-id>`
    - Region: us-east-1
-   - Uncheck "Block all public access" (keep all other blocks on)
+   - **Keep "Block all public access" turned ON** (this is correct -- the bucket should be private)
    - Enable default encryption: AES-256
    - Create bucket
 
@@ -332,6 +455,84 @@ terraform init
 
 ---
 
+#### Task 0.6: Terraform Version & Provider Configuration
+
+**Status:** Completed
+
+**Why This Matters:**
+
+Terraform needs to know two things before it can manage your infrastructure:
+
+1. **Which version of Terraform** to use (the CLI tool)
+2. **Which version of each provider** to use (the AWS provider in our case)
+
+Without explicit version constraints, Terraform will use whatever version it finds, which can lead to unexpected changes when you run `terraform init` on a different machine or after an update.
+
+**How-to:**
+
+1. **Create a `versions.tf` file** in your `terraform/` directory:
+
+```hcl
+terraform {
+  required_version = "~> 1.9"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+```
+
+2. **Run `terraform init`** to download the provider and initialize the backend
+
+**What the version operators mean:**
+
+| Operator  | Meaning                                       | Example                        |
+| --------- | --------------------------------------------- | ------------------------------ |
+| `~> 1.9`  | Any 1.9.x version (1.9.0, 1.9.1, 1.9.2, etc.) | "~> 1.9" = 1.9.0 to 1.99.99    |
+| `~> 6.0`  | Any 6.x version (6.0.0 through 6.99.99)       | "~> 6.0" = 6.0.0 to 6.99.99    |
+| `>= 1.0`  | Any version 1.0 or higher (risky!)            | Could jump to 2.0 unexpectedly |
+| `= 1.9.5` | Exact version only (inflexible)               | Avoid unless necessary         |
+
+**Best Practice:**
+
+- Pin the **Terraform CLI version** to a minor version (e.g., `~> 1.9`)
+- Pin the **provider version** to a major version (e.g., `~> 6.0`)
+- This allows patch updates (bug fixes) but prevents breaking changes
+
+**Code Snippets:**
+
+```bash
+# Check your Terraform version
+terraform --version
+# Expected: Terraform v1.9.x
+
+# Check your AWS provider version (after terraform init)
+cat .terraform.lock.hcl | grep aws
+# Should show: version = "6.34.0" (or ~> 6.0 compatible)
+
+# Update providers (when needed)
+terraform init -upgrade
+
+# See which providers are installed
+terraform providers
+```
+
+**Lessons Learned:**
+
+- Always version-pin your Terraform and providers for reproducibility
+- Use `-upgrade` flag sparingly -- only when you intentionally want to update versions
+- The `versions.tf` file is read before the backend is initialized, so it's required even when using a remote backend
+
+**Resources:**
+
+- [Terraform Version Constraints](https://developer.terraform.io/language/migrate/terraform-1-1)
+- [Provider Versioning](https://developer.terraform.io/language/providers/version-constraints)
+
+---
+
 ### Module 1: Static Website Hosting (S3 + CloudFront)
 
 **Status:** In Progress
@@ -353,11 +554,113 @@ terraform init
 - Maximum object size: 5 TB.
 - S3 supports server-side encryption (SSE-S3, SSE-KMS, SSE-C).
 
+**Availability vs. Durability:**
+
+Understanding the difference between availability and durability is important for the exam:
+
+- **Durability** (S3): 99.999999999% (11 nines) -- means your data is _extremely unlikely_ to be lost. Even if you write 10 million objects to S3, you'd statistically lose only 1 object once every 10,000 years.
+
+- **Availability** (S3 Standard): 99.99% -- means your data is accessible 99.99% of the time. That's about 53 minutes of downtime per year. S3 Standard has higher availability than IA or Glacier storage classes.
+
+Think of it this way:
+
+- **Durability** = "Will my data still be there tomorrow?" (S3's job)
+- **Availability** = "Can I access my data right now?" (Your SLA)
+
+---
+
+#### Amazon S3 Storage Classes
+
+S3 offers multiple **storage classes** optimized for different use cases. Understanding when to use each is a key exam topic:
+
+**S3 Standard (Default):**
+
+- **Use for**: Frequently accessed data, hot storage, primary data stores
+- **Cost**: Highest per GB; has retrieval fees
+- **Durability**: 11 nines | **Availability**: 99.99%
+- **Example**: User-uploaded photos in an active fitness app
+
+**S3 Standard-Infrequent Access (S3 Standard-IA):**
+
+- **Use for**: Data accessed less than once a month but needs rapid access when needed
+- **Cost**: Lower storage cost than Standard; per-GB retrieval fee applies
+- **Durability**: 11 nines | **Availability**: 99.9%
+- **Example**: Last month's workout logs (still need fast access occasionally)
+
+**S3 One Zone-Infrequent Access (S3 One Zone-IA):**
+
+- **Use for**: infrequently accessed data that can be recreated
+- **Cost**: Even lower than Standard-IA (30-40% savings)
+- **Durability**: 11 nines (but stored in ONE AZ -- if AZ is destroyed, data is lost)
+- **Availability**: 99.5%
+- **Example**: thumbnail images, derived data that can be regenerated
+- **Exam tip**: Don't use for critical data that can't be recreated
+
+**S3 Glacier Instant Retrieval:**
+
+- **Use for**: Archive data that needs instant access (< 1 second) but is rarely accessed
+- **Cost**: Very low storage; per-GB retrieval fee
+- **Retrieval time**: Instant (milliseconds)
+- **Example**: Historical annual fitness reports you might reference
+
+**S3 Glacier Flexible Retrieval:**
+
+- **Use for**: Long-term archives where retrieval time is flexible
+- **Cost**: Lowest storage; free retrievals up to 5% of bucket per month
+- **Retrieval times**:
+  - Expedited: 1-5 minutes
+  - Standard: 3-5 hours
+  - Bulk: 5-12 hours
+- **Example**: Tax documents, multi-year health data archives
+
+**S3 Glacier Deep Archive:**
+
+- **Use for**: Longest-term storage (7+ years), regulatory compliance
+- **Cost**: Lowest of all classes
+- **Retrieval times**:
+  - Standard: 12 hours
+  - Bulk: 48 hours
+- **Example**: Legal records, compliance archives
+
+**S3 Intelligent-Tiering:**
+
+- **Use for**: Unknown or unpredictable access patterns
+- **How it works**: Automatically moves objects between tiers based on access frequency
+- **Cost**: Small monthly monitoring fee; no retrieval fees
+- **Durability**: 11 nines | **Availability**: 99.9%
+- **Example**: User-generated content where some workouts get viewed often, others rarely
+
+**Choosing a Storage Class (Exam Tips):**
+
+| If data access is...            | Use...                        |
+| ------------------------------- | ----------------------------- |
+| Frequent/hot                    | S3 Standard                   |
+| Occasional (monthly)            | S3 Standard-IA                |
+| Rare, can recreate if lost      | S3 One Zone-IA                |
+| Archive, need instant retrieval | S3 Glacier Instant Retrieval  |
+| Archive, flexible retrieval OK  | S3 Glacier Flexible Retrieval |
+| Very long-term, compliance      | S3 Glacier Deep Archive       |
+| Unpredictable                   | S3 Intelligent-Tiering        |
+
+**For FitCloud:** We'll use S3 Standard for our website assets (hot storage, needs fast access). For a production fitness app, you might move old workout logs to Standard-IA after 30 days using S3 Lifecycle policies.
+
+**Study Questions:**
+
+- What's the main difference between S3 Standard-IA and S3 One Zone-IA?
+- If you need to retrieve archived workout data within 1 hour, which storage class should you use?
+- Can you lose data in S3 One Zone-IA? What's the risk?
+- How does S3 Intelligent-Tiering decide when to move objects?
+
+**Resources:**
+
+- [S3 Storage Classes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html)
+- [S3 Pricing](https://aws.amazon.com/s3/pricing/)
+
 **Amazon CloudFront (CDN):**
 
 - **Distribution** - A CloudFront configuration that tells AWS which origin to pull content from and how to serve it.
 - **Origin** - Where CloudFront fetches the original content (your S3 bucket).
-- **Edge Location** - A data center close to end users where content gets cached. 400+ worldwide.
+- **Edge Location** - A data center close to end users where content gets cached. Hundreds worldwide.
 - **TTL (Time to Live)** - How long CloudFront caches content before checking the origin again.
 - **Cache Invalidation** - Force CloudFront to re-fetch content from origin (costs money after 1,000 paths/month).
 - **Default Root Object** - The file served when someone visits the root URL (e.g., `index.html`).
@@ -379,6 +682,93 @@ terraform init
   1. CloudFront signs every request to S3 using SigV4
   2. S3 bucket policy checks the signature matches CloudFront's ARN
   3. If valid, S3 returns the object; if not, 403 Access Denied
+
+---
+
+#### Understanding AWS Global Infrastructure: Regions, Availability Zones & Edge Locations
+
+This is a **core concept** for the Cloud Practitioner exam. AWS infrastructure is organized in three layers:
+
+**AWS Regions:**
+
+- A **Region** is a physical geographic location around the world where AWS has multiple data centers (Availability Zones)
+- Examples: `us-east-1` (N. Virginia), `eu-west-1` (Ireland), `ap-southeast-1` (Singapore)
+- Each Region is **isolated** -- resources in one Region don't automatically replicate to another
+- **You choose which Region** when creating most resources
+- Some services are **global** (IAM, Route 53, CloudFront) and don't require Region selection
+
+**Availability Zones (AZs):**
+
+- An **Availability Zone** is one or more discrete data centers within a Region, with independent power, networking, and cooling
+- Each Region has multiple AZs (typically 3, sometimes more)
+- AZs are connected with low-latency networking -- they're close enough to work together but far enough apart to survive a local disaster
+- Example: `us-east-1a`, `us-east-1b`, `us-east-1c` are three AZs in the us-east-1 Region
+
+**Why This Matters for High Availability:**
+
+```
+Region: us-east-1
+├── AZ: us-east-1a  (data center in Virginia)
+├── AZ: us-east-1b  (different data center in Virginia)
+└── AZ: us-east-1c  (third data center in Virginia)
+```
+
+- If one AZ fails (power outage, network issue), your application can fail over to another
+- For **high availability**, you deploy across multiple AZs
+- For **disaster recovery**, you might deploy across multiple Regions
+
+**Edge Locations:**
+
+- **Edge Locations** are smaller data centers distributed globally, closer to users than Regions
+- Used by **CloudFront** (CDN) to cache content near users
+- Also used by **Route 53** for DNS routing
+- There are **hundreds** of edge locations worldwide
+- Edge locations don't run your EC2 instances or store your DynamoDB data -- they're for content delivery and low-latency routing
+
+**The Hierarchy:**
+
+```
+AWS Global Infrastructure
+├── Regions (15+ worldwide)
+│   ├── Availability Zones (3-6 per Region)
+│   │   └── Data Centers (1 or more per AZ)
+│   └── Regional Services (EC2, Lambda, DynamoDB)
+│
+└── Edge Locations (hundreds worldwide)
+    ├── CloudFront caching
+    └── Route 53 DNS
+```
+
+**FitCloud's Infrastructure Location:**
+
+| Resource   | Scope    | Location                    |
+| ---------- | -------- | --------------------------- |
+| S3 bucket  | Regional | `us-east-1` (we chose this) |
+| DynamoDB   | Regional | `us-east-1` (future module) |
+| Lambda     | Regional | `us-east-1` (future module) |
+| CloudFront | Global   | Edge locations worldwide    |
+| IAM        | Global   | Global (no Region needed)   |
+| Cognito    | Regional | `us-east-1`                 |
+| Route 53   | Global   | Global DNS                  |
+
+**Key Exam Points:**
+
+- Resources in one Region **do not** automatically replicate to another
+- To achieve high availability, deploy across **multiple AZs** in the same Region
+- Edge locations are for **content delivery** (CloudFront), not compute/storage
+- IAM and CloudFront are **global services** -- they don't have a Region
+
+**Study Questions:**
+
+- If you deploy your application in two AZs and one AZ fails, what happens to your users?
+- Can you access DynamoDB data from an edge location? Why or why not?
+- What's the difference between deploying in `us-east-1` vs `eu-west-1`?
+- Why does CloudFront use edge locations instead of just serving from the nearest Region?
+
+**Resources:**
+
+- [AWS Global Infrastructure](https://aws.amazon.com/about-aws/global-infrastructure/)
+- [Regions and Availability Zones](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html)
 
 #### Architecture Diagram
 
@@ -616,6 +1006,11 @@ resource "aws_cloudfront_distribution" "website" {
         forward = "none"
       }
     }
+
+    # Note: forwarded_values is the legacy approach. For production, consider using
+    # aws_cloudfront_cache_policy and aws_cloudfront_origin_request_policy for
+    # more control over caching behavior. The forwarded_values block still works
+    # and is used here for simplicity.
 
     min_ttl     = 0
     default_ttl = 3600
@@ -990,6 +1385,39 @@ Cognito has two main components:
 - Useful when your frontend needs direct access to AWS services (like uploading directly to S3)
 - Not needed for most web apps -- User Pools + API Gateway is usually sufficient
 
+---
+
+**Cognito vs. IAM: When to Use Which?**
+
+A common point of confusion is: "When do I use Cognito vs. IAM?" Both are about identity and access, but they serve different purposes:
+
+|                     | **IAM**                                                 | **Cognito**                               |
+| ------------------- | ------------------------------------------------------- | ----------------------------------------- |
+| **Manages**         | Access to **AWS services and resources**                | Access to **your application**            |
+| **Users represent** | Employees, developers, systems that need AWS access     | End users of your application (customers) |
+| **Credentials**     | Long-term access keys / console passwords               | Temporary JWT tokens (short-lived)        |
+| **Use case**        | "Can this developer deploy to production?"              | "Can this user view their workout data?"  |
+| **Examples**        | Admin user, Lambda execution role, EC2 instance profile | App sign-up/sign-in, social login         |
+
+**The Key Distinction:**
+
+- **IAM** answers: _"Who can access MY AWS ACCOUNT?"_ (developers, operators, IT)
+- **Cognito** answers: _"Who can access MY APPLICATION?"_ (your app's users)
+
+**For FitCloud:**
+
+- We use **IAM** to give our Terraform CLI access to our AWS account
+- We use **Cognito** to let end users sign up and sign in to our fitness app
+- Our Lambda functions use **IAM roles** to access DynamoDB, but the _permission to call_ those Lambda functions is controlled by **Cognito** via API Gateway authorization
+
+This is the Shared Responsibility Model in action: AWS manages Cognito's infrastructure, but _you_ manage who can sign up and sign in to your app.
+
+**Study Questions:**
+
+- If you wanted to give a developer access to view CloudWatch logs, would you use IAM or Cognito?
+- Can Cognito users access the AWS Console directly? Why or why not?
+- What's the security difference between an IAM access key (permanent) and a Cognito access token (expires in 1 hour)?
+
 **For FitCloud:** We only need a **User Pool**. The JWT tokens will be validated by API Gateway, and our Lambda functions will use the `userId` from the token to scope data to the authenticated user. We do NOT need an Identity Pool.
 
 **OAuth 2.0 Grants:**
@@ -1287,6 +1715,10 @@ resource "aws_cognito_user_pool_client" "main" {
   allowed_oauth_flows_user_pool_client = true
   allowed_oauth_scopes                 = ["openid", "email", "profile"]
 
+  # IMPORTANT: Public clients (like SPAs) should NOT generate a client secret
+  # because it would be exposed in the browser. Only use for confidential clients.
+  generate_secret = false
+
   # Callback and Logout URLs
   callback_urls = [
     "http://localhost:5173",
@@ -1298,8 +1730,14 @@ resource "aws_cognito_user_pool_client" "main" {
     "https://${var.domain != "" ? var.domain : "localhost:5173"}"
   ]
 
-  # Token Settings
-  access_tokenValidity  = 1  # 1 hour
+  # Token Settings - specify the units explicitly for clarity
+  token_validity_units {
+    access_token  = "hours"
+    id_token      = "hours"
+    refresh_token = "days"
+  }
+
+  access_token_validity  = 1  # 1 hour
   id_token_validity     = 1  # 1 hour
   refresh_token_validity = 30 # 30 days
 
