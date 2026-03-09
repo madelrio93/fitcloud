@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "aws-cdk-development": {
+      "source": "zxkane/aws-skills",
+      "sourceType": "github",
+      "computedHash": "eb07001bd945f4b73f8f0d1a6de7ef5aceada590c93dc6e604cfb3753d38fb6c"
+    },
+    "terraform-skill": {
+      "source": "antonbabenko/terraform-skill",
+      "sourceType": "github",
+      "computedHash": "fd9c3003ede67cd3fd352946d4e081688232070cb76f79cf41a25b477c0c5cf6"
+    }
+  }
+}
