@@ -1,8 +1,8 @@
-resource "aws_dynamodb_table" "workouts" {
-    name = "${var.project_name}-workouts-${var.environment}"
+resource "aws_dynamodb_table" "profile" {
+    name = "${var.project_name}-profile-${var.environment}"
     billing_mode = "PAY_PER_REQUEST"
     hash_key = "userId"
-    range_key = "workoutId"
+    range_key = "sortKey"
 
     attribute {
       name = "userId"
@@ -10,7 +10,7 @@ resource "aws_dynamodb_table" "workouts" {
     }
 
     attribute {
-      name = "workoutId"
+      name = "sortKey"
       type = "S"
     }
 

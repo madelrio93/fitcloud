@@ -1,9 +1,9 @@
-output "workouts_table_name" {
-  value = aws_dynamodb_table.workouts.name
-  description = "Name of the DynamoDB table for workouts"          
+output "profile_table_name" {
+  value = aws_dynamodb_table.profile.name
+  description = "Name of the DynamoDB table for profile"          
 }
 
-output "workouts_table_arn" {
-  value = aws_dynamodb_table.workouts.arn
-  description = "ARN of the DynamoDB table for workouts"
+output "profile_table_arn" {
+  value = aws_dynamodb_table.profile.arn
+  description = "ARN of the DynamoDB table for profile"
 }
