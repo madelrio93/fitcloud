@@ -14,5 +14,9 @@
     "@aws-sdk/lib-dynamodb": "^3.1006.0",
     "@types/node": "^25.4.0",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@types/aws-lambda": "^8.10.161",
+    "zod": "^4.3.6"
   }
 }
