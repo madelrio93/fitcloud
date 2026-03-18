@@ -16,3 +16,8 @@ variable "project_name" {
   default     = "fitcloud"
 }
 
+variable "profile_table_name" {
+  description = "Name of the DynamoDB table for user profiles"
+  type        = string
+} 
+
