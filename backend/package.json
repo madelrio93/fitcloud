@@ -4,7 +4,14 @@
   "description": "FitCloud backend application",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "tsc -p tsconfig.json --watch --noEmit false --outDir dist",
+    "build": "tsc -p tsconfig.json --noEmit false --outDir dist",
+    "build:watch": "tsc -p tsconfig.json --watch --noEmit false --outDir dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "npm run typecheck",
+    "lint:fix": "npm run typecheck",
+    "test": "node --test",
+    "test:watch": "node --test --watch"
   },
   "keywords": [],
   "author": "",
@@ -14,9 +21,5 @@
     "@aws-sdk/lib-dynamodb": "^3.1006.0",
     "@types/node": "^25.4.0",
     "typescript": "^5.9.3"
-  },
-  "dependencies": {
-    "@types/aws-lambda": "^8.10.161",
-    "zod": "^4.3.6"
   }
 }
